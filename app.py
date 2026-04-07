@@ -114,7 +114,9 @@ def call_claude(system_prompt, user_message):
             result = _json.loads(resp.read().decode("utf-8"))
             return result["content"][0]["text"]
     except Exception as e:
+        import traceback
         print(f"[claude error] {e}", flush=True)
+        traceback.print_exc()
         return ""
 
 def detect_language(text):
