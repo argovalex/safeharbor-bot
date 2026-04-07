@@ -91,11 +91,11 @@ def send_messages_with_delay(to, parts, delay=5):
             time.sleep(delay)
 
 def call_claude(system_prompt, user_message):
-    """Call Claude API using requests instead of anthropic SDK to avoid httpx Unicode issues."""
+    import json as _json
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "content-type": "application/json; charset=utf-8"
     }
     payload = {
         "model": "claude-sonnet-4-5",
@@ -104,10 +104,11 @@ def call_claude(system_prompt, user_message):
         "messages": [{"role": "user", "content": user_message}]
     }
     try:
+        body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
-            json=payload,
+            data=body,
             timeout=30
         )
         r.raise_for_status()
