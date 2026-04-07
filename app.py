@@ -1,3 +1,4 @@
+# v5
 import os
 import time
 import threading
@@ -15,16 +16,90 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messag
 
 user_states = {}
 
+WELCOME_MESSAGE = (
+    "שלום, אני נמל הבית. אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.\n\n"
+    "אם אתה מרגיש שקשה להתמודד לבד, דע שתמיד יש מי שמקשיב ומחכה לך:\n"
+    "\U0001f4de ער\"ן (סיוע נפשי): 1201 | \U0001f4ac https://wa.me/972528451201\n"
+    "\U0001f4ac סה\"ר (סיוע והקשבה): https://wa.me/972543225656\n"
+    "\U0001f4de נט\"ל (טראומה): 1-800-363-363\n\n"
+    "מה יעזור לך יותר ברגע הזה?\n"
+    "\U0001f32c\ufe0f א) תרגילי נשימה\n"
+    "\u2693 ב) תרגיל קרקוע"
+)
+
+RETURNING_MESSAGE = (
+    "היי, טוב שחזרת אלי. \U0001f499\n"
+    "אני נמל הבית, ואני כאן איתך שוב.\n"
+    "בוא נעצור לרגע, נניח להכל מסביב, ונחזור יחד לחוף מבטחים.\n\n"
+    "מה מרגיש לך נכון יותר ברגע הזה?\n"
+    "\U0001f32c\ufe0f א) נשימה מרגיעה\n"
+    "\u2693 ב) תרגיל קרקוע\n\n"
+    "זכור שיש עזרה אנושית זמינה עבורך תמיד:\n"
+    "\U0001f4de חיוג ישיר לער\"ן: 1201\n"
+    "\U0001f4ac ער\"ן ב-WhatsApp: https://wa.me/972528451201\n"
+    "\U0001f4ac סהר ב-WhatsApp: https://wa.me/972543225656\n"
+    "\U0001f4de נט\"ל: 1-800-363-363"
+)
+
+
 def get_state(phone):
     if phone not in user_states:
-        user_states[phone] = {"tool": "none", "step": 0, "wait_count": 0}
+        user_states[phone] = {"tool": "none", "step": 0, "wait_count": 0, "welcomed": False, "last_msg_time": 0, "nudge_sent": False}
     return user_states[phone]
 
-def set_state(phone, tool=None, step=None, wait_count=None):
+def nudge_if_silent(phone, delay=30):
+    """Send nudge messages if user is silent. Two nudges then exit exercise."""
+    import time as _time
+
+    # First nudge after 30 seconds
+    _time.sleep(delay)
+    state = get_state(phone)
+    if state["tool"] not in ["grounding", "breathing"] or state["nudge_sent"]:
+        return
+    elapsed = _time.time() - state["last_msg_time"]
+    if elapsed < delay - 2:
+        return
+
+    state["nudge_sent"] = True
+    send_message(phone, "אני כאן איתך, אתה עדיין איתי? בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. ⚓")
+
+    # Second nudge after another 60 seconds
+    _time.sleep(60)
+    state = get_state(phone)
+    if state["tool"] not in ["grounding", "breathing"]:
+        return
+    elapsed = _time.time() - state["last_msg_time"]
+    if elapsed < 85:
+        return
+
+    # Exit exercise and offer menu
+    set_state(phone, tool="none", step=0, wait_count=0)
+    send_message(
+        phone,
+        "אני עדיין כאן בשבילך. 💙
+
+"
+        "נראה שאתה צריך קצת זמן לעצמך - זה בסדר לגמרי.
+"
+        "כשתרגיש מוכן, אני כאן.
+
+"
+        "🌬️ א) נשימה מרגיעה
+"
+        "⚓ ב) תרגיל קרקוע
+
+"
+        "זכור: עזרה אנושית זמינה תמיד:
+"
+        "📞 ער"ן: 1201 | 💬 https://wa.me/972528451201"
+    )
+
+def set_state(phone, tool=None, step=None, wait_count=None, welcomed=None):
     s = get_state(phone)
     if tool is not None: s["tool"] = tool
     if step is not None: s["step"] = step
     if wait_count is not None: s["wait_count"] = wait_count
+    if welcomed is not None: s["welcomed"] = welcomed
 
 def send_message(to, text):
     if not text or not text.strip():
@@ -60,90 +135,118 @@ def call_claude(system_prompt, user_message):
     return response.content[0].text
 
 ORCHESTRATOR_PROMPT = (
-    "You are SafeHarbor, a calm gentle female emotional support guide. "
-    "Always speak as a woman. Never perform exercises yourself. "
-    "Respond in the same language the user writes in. "
-    "Welcome warmly and offer two options: "
-    "A) Breathing exercises or B) Grounding exercise. "
-    "Ask them to type A or B. "
+    "You are SafeHarbor, a warm maternal female emotional support guide. "
+    "You are a woman - always speak as a woman using feminine language. "
+    "You are caring, nurturing and calming like a mother figure. "
+    "Never perform exercises yourself. "
+    "Always respond in Hebrew. "
+    "If user seems lost or needs guidance, remind them they can type: "
+    "alef for breathing or bet for grounding. "
     "If user mentions crisis or self-harm, provide hotline numbers immediately."
 )
 
 GROUNDING_PROMPT = (
-    "You are a grounding specialist. Female guide, gentle and supportive. "
-    "Never mention breathing. Respond in same language as user. "
+    "You are a grounding specialist. Warm maternal female guide, gentle and supportive. "
+    "Always speak as a woman using feminine language. "
+    "Never mention breathing. Always respond in Hebrew. "
     "Based on Current_Step: "
-    "0: ask for 5 things they see. "
-    "1: 4 things they can touch. "
-    "2: 3 things they hear. "
-    "3: 2 things they smell. "
-    "4: 1 thing they taste. "
-    "5: ask how they feel now, say you are here with them. "
+    "0: Say exactly: בוא נתמקד ברגע הזה. ציין 5 דברים שאתה רואה סביבך כרגע. "
+    "1: Say exactly: מצוין. עכשיו ציין 4 דברים שאתה יכול לגעת בהם. "
+    "2: Say exactly: יופי. עכשיו ציין 3 דברים שאתה שומע סביבך. "
+    "3: Say exactly: נהדר. עכשיו ציין 2 דברים שאתה יכול להריח. "
+    "4: Say exactly: כמעט סיימנו. ציין דבר אחד שאתה יכול לטעום. "
+    "5: Say exactly: איך התחושה עכשיו? אני כאן איתך. "
     "Always respond based ONLY on the Current_Step provided."
 )
 
 BREATHING_PARTS = [
-    "I am here with you, let us begin together.",
-    "Breathe in slowly... 1-2-3-4-5",
-    "Hold... 1-2-3-4-5",
-    "Breathe out slowly... 1-2-3-4-5",
-    "Rest... 1-2-3-4-5",
-    "Breathe in slowly... 1-2-3-4-5",
-    "Hold... 1-2-3-4-5",
-    "Breathe out slowly... 1-2-3-4-5",
-    "Rest... 1-2-3-4-5",
-    "Breathe in slowly... 1-2-3-4-5",
-    "Hold... 1-2-3-4-5",
-    "Breathe out slowly... 1-2-3-4-5",
-    "Rest... 1-2-3-4-5",
-    "3 rounds done. How do you feel? Continue? (yes/no)"
+    "אני כאן איתך, נתחיל יחד. 🌬️",
+    "🌬️ שאיפה איטית... 21-22-23-24-25",
+    "✋ עצור... 21-22-23-24-25",
+    "🍃 נשיפה איטית... 21-22-23-24-25",
+    "⚓ מנוחה... 21-22-23-24-25",
+    "🌬️ שאיפה איטית... 21-22-23-24-25",
+    "✋ עצור... 21-22-23-24-25",
+    "🍃 נשיפה איטית... 21-22-23-24-25",
+    "⚓ מנוחה... 21-22-23-24-25",
+    "🌬️ שאיפה איטית... 21-22-23-24-25",
+    "✋ עצור... 21-22-23-24-25",
+    "🍃 נשיפה איטית... 21-22-23-24-25",
+    "⚓ מנוחה... 21-22-23-24-25",
+    "סיימנו 3 סבבים. איך התחושה? נמשיך? (כן/לא)"
 ]
 
 CRISIS_WORDS = [
     "suicide", "kill myself", "want to die", "end my life",
     "cut myself", "no reason to live", "cant go on",
     "no hope", "worthless", "goodbye forever",
+    "להתאבד", "למות", "לסיים הכל", "להיעלם", "רוצה למות",
+    "בא לי למות", "לחתוך", "להפסיק את הסבל", "אין טעם",
+    "אין תקווה", "חסר סיכוי", "קצה היכולת", "לא יכול יותר",
+    "נמאס לי מהכל", "אבוד לי", "מכתב פרידה", "צוואה",
+    "סליחה מכולם", "הכל נגמר", "קבר", "חושך מוחלט",
+    "לישון ולא לקום",
 ]
 
 CRISIS_MSG = (
-    "I understand you are going through a very difficult moment. "
-    "Please reach out for help right now.\n\n"
-    "Crisis line: 988 (US) | 116 123 (UK)\n"
-    "Text HOME to 741741\n"
-    "https://findahelpline.com\n\n"
-    "There are people who want to help you. Please contact them now."
+    "אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך.\n\n"
+    "📞 ערן: 1201\n"
+    "💬 וואטסאפ: https://wa.me/972528451201\n"
+    "💬 סהר: https://wa.me/972543225656\n"
+    "📞 נטל: 1-800-363-363\n\n"
+    "יש מי שרוצה לעזור לך. אנא פנה אליהם. 💙"
 )
 
 def is_crisis(text):
-    return any(w in text.lower() for w in CRISIS_WORDS)
+    return any(w.lower() in text.lower() for w in CRISIS_WORDS)
 
 def handle_message(phone, text):
     text = text.strip()
     state = get_state(phone)
+    import time as _time
+    state["last_msg_time"] = _time.time()
+    state["nudge_sent"] = False
     tool = state["tool"]
     step = state["step"]
 
+    # Crisis - highest priority
     if is_crisis(text):
         send_message(phone, CRISIS_MSG)
         return
 
+    # Welcome message logic
+    if not state["welcomed"]:
+        set_state(phone, welcomed=True)
+        send_message(phone, WELCOME_MESSAGE)
+        return
+    elif state["tool"] == "none" and text.lower() in ["שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי", "חזור"]:
+        send_message(phone, RETURNING_MESSAGE)
+        return
+
+    # Breathing exercise
     if tool == "breathing":
-        stop_words = ["no", "stop", "enough", "done", "לא", "די"]
+        stop_words = ["no", "stop", "enough", "done", "לא", "די", "לא תודה"]
         if any(w in text.lower() for w in stop_words):
             set_state(phone, tool="none", step=0)
-            send_message(phone, "Stopping here. I am here when you need me.")
+            send_message(phone, "עוצרים כאן. אני כאן כשתצטרך. 🙏")
             return
+        # User said yes/continue - start another round
+        def run_breathing_with_nudge(phone, parts, delay):
+            send_messages_with_delay(phone, parts, delay)
+            nudge_if_silent(phone, 30)
+
         threading.Thread(
-            target=send_messages_with_delay,
+            target=run_breathing_with_nudge,
             args=(phone, BREATHING_PARTS, 5),
             daemon=True
         ).start()
         return
 
+    # Grounding exercise
     if tool == "grounding":
         if text.lower() in ["reset", "back", "stop", "חזור", "איפוס", "די"]:
             set_state(phone, tool="none", step=0, wait_count=0)
-            send_message(phone, "OK, I am here when you need me.")
+            send_message(phone, "בסדר, אני כאן כשתצטרך. 🌊")
             return
         user_msg = f"Current_Step: {step}\nUser_Input: {text}"
         response = call_claude(GROUNDING_PROMPT, user_msg)
@@ -153,23 +256,35 @@ def handle_message(phone, text):
             set_state(phone, tool="none", step=0, wait_count=0)
         else:
             set_state(phone, step=new_step, wait_count=0)
+            threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
         return
 
-    if text.lower() in ["א", "a"]:
+    # Routing
+    if text in ["א", "a", "A"]:
         set_state(phone, tool="breathing", step=0)
-        send_message(phone, "Ready? Let us begin breathing together.")
+        send_message(phone, "בוא נתחיל בנשימות. אני כאן איתך. 🌬️")
+
+        def start_breathing_after_delay(phone, parts, delay):
+            import time as _t
+            _t.sleep(5)
+            send_messages_with_delay(phone, parts, delay)
+            nudge_if_silent(phone, 30)
+
+        threading.Thread(target=start_breathing_after_delay, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
         return
 
-    if text.lower() in ["ב", "b"]:
+    if text in ["ב", "b", "B"]:
         set_state(phone, tool="grounding", step=0, wait_count=0)
-        send_message(phone, "Let us begin the grounding exercise. Ready?")
+        send_message(phone, "בוא נתחיל בתרגיל קרקוע. מוכן? ⚓")
+        threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
         return
 
-    if text.lower() in ["ג", "c"]:
+    if text in ["ג", "c", "C"]:
         set_state(phone, tool="none", step=0)
-        send_message(phone, "Thank you. I am always here when you need me.")
+        send_message(phone, "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. ⛵")
         return
 
+    # General response
     response = call_claude(ORCHESTRATOR_PROMPT, text)
     send_message(phone, response)
 
