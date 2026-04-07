@@ -1,4 +1,4 @@
-# v7
+# v8 - Hebrew text direct, readable
 import os
 import time
 import threading
@@ -12,140 +12,9 @@ client = Anthropic()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "12345")
-WHATSAPP_API_URL = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages"
+WHATSAPP_API_URL = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 
 user_states = {}
-
-# ── Static messages (unicode escaped for Railway compatibility) ───────────────
-
-WELCOME_MESSAGE = (
-    "\u05e9\u05dc\u05d5\u05dd, \u05d0\u05e0\u05d9 \u05e0\u05de\u05dc \u05d4\u05d1\u05d9\u05ea. "
-    "\u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da \u05db\u05d3\u05d9 \u05dc\u05e2\u05d6\u05d5\u05e8 "
-    "\u05dc\u05da \u05dc\u05de\u05e6\u05d5\u05d0 \u05e7\u05e6\u05ea \u05e9\u05e7\u05d8 "
-    "\u05d5\u05dc\u05d4\u05ea\u05d9\u05d9\u05e6\u05d1 \u05d1\u05e8\u05d2\u05e2\u05d9\u05dd "
-    "\u05e9\u05de\u05e8\u05d2\u05d9\u05e9\u05d9\u05dd \u05e2\u05de\u05d5\u05e1\u05d9\u05dd \u05d0\u05d5 \u05db\u05d1\u05d3\u05d9\u05dd.\n\n"
-    "\u05d0\u05dd \u05d0\u05ea\u05d4 \u05de\u05e8\u05d2\u05d9\u05e9 \u05e9\u05e7\u05e9\u05d4 "
-    "\u05dc\u05d4\u05ea\u05de\u05d5\u05d3\u05d3 \u05dc\u05d1\u05d3, "
-    "\u05d3\u05e2 \u05e9\u05ea\u05de\u05d9\u05d3 \u05d9\u05e9 \u05de\u05d9 \u05e9\u05de\u05e7\u05e9\u05d9\u05d1 "
-    "\u05d5\u05de\u05d7\u05db\u05d4 \u05dc\u05da:\n"
-    "\U0001f4de \u05e2\u05e8\"\u05df: 1201 | \U0001f4ac https://wa.me/972528451201\n"
-    "\U0001f4ac \u05e1\u05d4\"\u05e8: https://wa.me/972543225656\n"
-    "\U0001f4de \u05e0\u05d8\"\u05dc: 1-800-363-363\n\n"
-    "\u05de\u05d4 \u05d9\u05e2\u05d6\u05d5\u05e8 \u05dc\u05da \u05d9\u05d5\u05ea\u05e8 \u05d1\u05e8\u05d2\u05e2 \u05d4\u05d6\u05d4?\n"
-    "\U0001f32c\ufe0f \u05d0) \u05ea\u05e8\u05d2\u05d9\u05dc\u05d9 \u05e0\u05e9\u05d9\u05de\u05d4\n"
-    "\u2693 \u05d1) \u05ea\u05e8\u05d2\u05d9\u05dc \u05e7\u05e8\u05e7\u05d5\u05e2"
-)
-
-RETURNING_MESSAGE = (
-    "\u05d4\u05d9\u05d9, \u05d8\u05d5\u05d1 \u05e9\u05d7\u05d6\u05e8\u05ea \u05d0\u05dc\u05d9. \U0001f499\n"
-    "\u05d0\u05e0\u05d9 \u05e0\u05de\u05dc \u05d4\u05d1\u05d9\u05ea, \u05d5\u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da \u05e9\u05d5\u05d1.\n"
-    "\u05d1\u05d5\u05d0 \u05e0\u05e2\u05e6\u05d5\u05e8 \u05dc\u05e8\u05d2\u05e2, \u05e0\u05e0\u05d9\u05d7 \u05dc\u05d4\u05db\u05dc "
-    "\u05de\u05e1\u05d1\u05d9\u05d1, \u05d5\u05e0\u05d7\u05d6\u05d5\u05e8 \u05d9\u05d7\u05d3 \u05dc\u05d7\u05d5\u05e3 \u05de\u05d1\u05d8\u05d7\u05d9\u05dd.\n\n"
-    "\u05de\u05d4 \u05de\u05e8\u05d2\u05d9\u05e9 \u05dc\u05da \u05e0\u05db\u05d5\u05df \u05d9\u05d5\u05ea\u05e8 \u05d1\u05e8\u05d2\u05e2 \u05d4\u05d6\u05d4?\n"
-    "\U0001f32c\ufe0f \u05d0) \u05e0\u05e9\u05d9\u05de\u05d4 \u05de\u05e8\u05d2\u05d9\u05e2\u05d4\n"
-    "\u2693 \u05d1) \u05ea\u05e8\u05d2\u05d9\u05dc \u05e7\u05e8\u05e7\u05d5\u05e2\n\n"
-    "\u05d6\u05db\u05d5\u05e8 \u05e9\u05d9\u05e9 \u05e2\u05d6\u05e8\u05d4 \u05d0\u05e0\u05d5\u05e9\u05d9\u05ea \u05d6\u05de\u05d9\u05e0\u05d4 \u05ea\u05de\u05d9\u05d3:\n"
-    "\U0001f4de \u05e2\u05e8\"\u05df: 1201 | \U0001f4ac https://wa.me/972528451201\n"
-    "\U0001f4ac \u05e1\u05d4\"\u05e8: https://wa.me/972543225656\n"
-    "\U0001f4de \u05e0\u05d8\"\u05dc: 1-800-363-363"
-)
-
-NUDGE_MESSAGE = (
-    "\u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da, \u05d0\u05ea\u05d4 \u05e2\u05d3\u05d9\u05d9\u05df \u05d0\u05d9\u05ea\u05d9? "
-    "\u05d1\u05d5\u05d0 \u05e0\u05de\u05e9\u05d9\u05da \u05d9\u05d7\u05d3 \u05d1\u05ea\u05e8\u05d2\u05d9\u05dc, "
-    "\u05d6\u05d4 \u05e2\u05d5\u05d6\u05e8 \u05dc\u05d4\u05d7\u05d6\u05d9\u05e8 \u05d0\u05ea \u05d4\u05e9\u05dc\u05d9\u05d8\u05d4. \u2693"
-)
-
-TIMEOUT_MESSAGE = (
-    "\u05d0\u05e0\u05d9 \u05e2\u05d3\u05d9\u05d9\u05df \u05db\u05d0\u05df \u05d1\u05e9\u05d1\u05d9\u05dc\u05da. \U0001f499\n\n"
-    "\u05e0\u05e8\u05d0\u05d4 \u05e9\u05d0\u05ea\u05d4 \u05e6\u05e8\u05d9\u05da \u05e7\u05e6\u05ea \u05d6\u05de\u05df "
-    "\u05dc\u05e2\u05e6\u05de\u05da - \u05d6\u05d4 \u05d1\u05e1\u05d3\u05e8 \u05dc\u05d2\u05de\u05e8\u05d9.\n"
-    "\u05db\u05e9\u05ea\u05e8\u05d2\u05d9\u05e9 \u05de\u05d5\u05db\u05df, \u05d0\u05e0\u05d9 \u05db\u05d0\u05df.\n\n"
-    "\U0001f32c\ufe0f \u05d0) \u05e0\u05e9\u05d9\u05de\u05d4 \u05de\u05e8\u05d2\u05d9\u05e2\u05d4\n"
-    "\u2693 \u05d1) \u05ea\u05e8\u05d2\u05d9\u05dc \u05e7\u05e8\u05e7\u05d5\u05e2\n\n"
-    "\U0001f4de \u05e2\u05e8\"\u05df: 1201 | \U0001f4ac https://wa.me/972528451201"
-)
-
-CRISIS_MSG = (
-    "\u05d0\u05e0\u05d9 \u05de\u05d1\u05d9\u05e0\u05d4 \u05e9\u05d0\u05ea\u05d4 \u05e2\u05d5\u05d1\u05e8 "
-    "\u05e8\u05d2\u05e2 \u05e7\u05e9\u05d4 \u05de\u05d0\u05d5\u05d3. \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da.\n\n"
-    "\U0001f4de \u05e2\u05e8\"\u05df: 1201\n"
-    "\U0001f4ac https://wa.me/972528451201\n"
-    "\U0001f4ac \u05e1\u05d4\"\u05e8: https://wa.me/972543225656\n"
-    "\U0001f4de \u05e0\u05d8\"\u05dc: 1-800-363-363\n\n"
-    "\u05d9\u05e9 \u05de\u05d9 \u05e9\u05e8\u05d5\u05e6\u05d4 \u05dc\u05e2\u05d6\u05d5\u05e8 \u05dc\u05da. "
-    "\u05d0\u05e0\u05d0 \u05e4\u05e0\u05d4 \u05d0\u05dc\u05d9\u05d4\u05dd. \U0001f499"
-)
-
-OFF_TOPIC_MSG = (
-    "\u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05e8\u05e7 \u05db\u05d3\u05d9 \u05dc\u05e2\u05d6\u05d5\u05e8 "
-    "\u05dc\u05da \u05dc\u05d4\u05ea\u05e8\u05d2\u05e2 \u05d5\u05dc\u05d4\u05ea\u05d9\u05d9\u05e6\u05d1. "
-    "\u05d1\u05d5\u05d0 \u05e0\u05ea\u05de\u05e7\u05d3 \u05d1\u05de\u05d4 \u05e9\u05de\u05e8\u05d2\u05d9\u05e9 \u05d1\u05e8\u05d2\u05e2 \u05d6\u05d4:\n\n"
-    "\U0001f32c\ufe0f \u05d0) \u05ea\u05e8\u05d2\u05d9\u05dc\u05d9 \u05e0\u05e9\u05d9\u05de\u05d4\n"
-    "\u2693 \u05d1) \u05ea\u05e8\u05d2\u05d9\u05dc \u05e7\u05e8\u05e7\u05d5\u05e2"
-)
-
-BREATHING_PARTS = [
-    "\u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da, \u05e0\u05ea\u05d7\u05d9\u05dc \u05d9\u05d7\u05d3. \U0001f32c\ufe0f",
-    "\U0001f32c\ufe0f \u05e9\u05d0\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u270b \u05e2\u05e6\u05d5\u05e8... 21-22-23-24-25",
-    "\U0001f343 \u05e0\u05e9\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u2693 \u05de\u05e0\u05d5\u05d7\u05d4... 21-22-23-24-25",
-    "\U0001f32c\ufe0f \u05e9\u05d0\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u270b \u05e2\u05e6\u05d5\u05e8... 21-22-23-24-25",
-    "\U0001f343 \u05e0\u05e9\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u2693 \u05de\u05e0\u05d5\u05d7\u05d4... 21-22-23-24-25",
-    "\U0001f32c\ufe0f \u05e9\u05d0\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u270b \u05e2\u05e6\u05d5\u05e8... 21-22-23-24-25",
-    "\U0001f343 \u05e0\u05e9\u05d9\u05e4\u05d4 \u05d0\u05d9\u05d8\u05d9\u05ea... 21-22-23-24-25",
-    "\u2693 \u05de\u05e0\u05d5\u05d7\u05d4... 21-22-23-24-25",
-    "\u05e1\u05d9\u05d9\u05de\u05e0\u05d5 3 \u05e1\u05d1\u05d1\u05d9\u05dd. \u05d0\u05d9\u05da \u05d4\u05ea\u05d7\u05d5\u05e9\u05d4? \u05e0\u05de\u05e9\u05d9\u05da? (\u05db\u05df/\u05dc\u05d0)"
-]
-
-GROUNDING_STEPS = [
-    "\u05d1\u05d5\u05d0 \u05e0\u05ea\u05de\u05e7\u05d3 \u05d1\u05e8\u05d2\u05e2 \u05d4\u05d6\u05d4. \u05e6\u05d9\u05d9\u05df 5 \u05d3\u05d1\u05e8\u05d9\u05dd \u05e9\u05d0\u05ea\u05d4 \u05e8\u05d5\u05d0\u05d4 \u05e1\u05d1\u05d9\u05d1\u05da \u05db\u05e8\u05d2\u05e2.",
-    "\u05de\u05e6\u05d5\u05d9\u05df. \u05e2\u05db\u05e9\u05d9\u05d5 \u05e6\u05d9\u05d9\u05df 4 \u05d3\u05d1\u05e8\u05d9\u05dd \u05e9\u05d0\u05ea\u05d4 \u05d9\u05db\u05d5\u05dc \u05dc\u05d2\u05e2\u05ea \u05d1\u05d4\u05dd.",
-    "\u05d9\u05d5\u05e4\u05d9. \u05e2\u05db\u05e9\u05d9\u05d5 \u05e6\u05d9\u05d9\u05df 3 \u05d3\u05d1\u05e8\u05d9\u05dd \u05e9\u05d0\u05ea\u05d4 \u05e9\u05d5\u05de\u05e2 \u05e1\u05d1\u05d9\u05d1\u05da.",
-    "\u05e0\u05d4\u05d3\u05e8. \u05e2\u05db\u05e9\u05d9\u05d5 \u05e6\u05d9\u05d9\u05df 2 \u05d3\u05d1\u05e8\u05d9\u05dd \u05e9\u05d0\u05ea\u05d4 \u05d9\u05db\u05d5\u05dc \u05dc\u05d4\u05e8\u05d9\u05d7.",
-    "\u05db\u05de\u05e2\u05d8 \u05e1\u05d9\u05d9\u05de\u05e0\u05d5. \u05e6\u05d9\u05d9\u05df \u05d3\u05d1\u05e8 \u05d0\u05d7\u05d3 \u05e9\u05d0\u05ea\u05d4 \u05d9\u05db\u05d5\u05dc \u05dc\u05d8\u05e2\u05d5\u05dd.",
-    "\u05d0\u05d9\u05da \u05d4\u05ea\u05d7\u05d5\u05e9\u05d4 \u05e2\u05db\u05e9\u05d9\u05d5? \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da.",
-]
-
-CRISIS_WORDS = [
-    "suicide", "kill myself", "want to die", "end my life",
-    "cut myself", "no reason to live", "no hope", "worthless",
-    "\u05dc\u05d4\u05ea\u05d0\u05d1\u05d3", "\u05dc\u05de\u05d5\u05ea", "\u05dc\u05e1\u05d9\u05d9\u05dd \u05d4\u05db\u05dc",
-    "\u05dc\u05d4\u05d9\u05e2\u05dc\u05dd", "\u05e8\u05d5\u05e6\u05d4 \u05dc\u05de\u05d5\u05ea",
-    "\u05d1\u05d0 \u05dc\u05d9 \u05dc\u05de\u05d5\u05ea", "\u05dc\u05d7\u05ea\u05d5\u05da",
-    "\u05dc\u05d4\u05e4\u05e1\u05d9\u05e7 \u05d0\u05ea \u05d4\u05e1\u05d1\u05dc",
-    "\u05d0\u05d9\u05df \u05d8\u05e2\u05dd", "\u05d0\u05d9\u05df \u05ea\u05e7\u05d5\u05d5\u05d4",
-    "\u05d7\u05e1\u05e8 \u05e1\u05d9\u05db\u05d5\u05d9", "\u05e7\u05e6\u05d4 \u05d4\u05d9\u05db\u05d5\u05dc\u05ea",
-    "\u05dc\u05d0 \u05d9\u05db\u05d5\u05dc \u05d9\u05d5\u05ea\u05e8", "\u05e0\u05de\u05d0\u05e1 \u05dc\u05d9 \u05de\u05d4\u05db\u05dc",
-    "\u05d0\u05d1\u05d5\u05d3 \u05dc\u05d9", "\u05de\u05db\u05ea\u05d1 \u05e4\u05e8\u05d9\u05d3\u05d4",
-    "\u05e6\u05d5\u05d5\u05d0\u05d4", "\u05e1\u05dc\u05d9\u05d7\u05d4 \u05de\u05db\u05d5\u05dc\u05dd",
-    "\u05d4\u05db\u05dc \u05e0\u05d2\u05de\u05e8", "\u05d7\u05d5\u05e9\u05da \u05de\u05d5\u05d7\u05dc\u05d8",
-    "\u05dc\u05d9\u05e9\u05d5\u05df \u05d5\u05dc\u05d0 \u05dc\u05e7\u05d5\u05dd",
-]
-
-# Off-topic detection keywords
-OFF_TOPIC_KEYWORDS = [
-    "who are you", "what are you", "tell me about", "your name", "your age",
-    "where are you", "are you human", "are you ai", "are you a bot",
-    "who made you", "weather", "news", "politics", "sport", "recipe",
-    "phone number", "address", "email", "password", "credit card",
-    "user", "users", "data", "database", "information about",
-    "\u05de\u05d9 \u05d0\u05ea\u05d4", "\u05de\u05d4 \u05d0\u05ea\u05d4",
-    "\u05e1\u05e4\u05e8 \u05dc\u05d9", "\u05de\u05d9\u05d3\u05e2",
-    "\u05de\u05e9\u05ea\u05de\u05e9\u05d9\u05dd", "\u05de\u05e9\u05ea\u05de\u05e9",
-    "\u05e4\u05e8\u05d8\u05d9\u05dd", "\u05e0\u05ea\u05d5\u05e0\u05d9\u05dd",
-    "\u05de\u05d0\u05d9\u05df \u05d0\u05ea\u05d4", "\u05d0\u05d9\u05e4\u05d4 \u05d0\u05ea\u05d4",
-]
-
-def is_crisis(text):
-    return any(w.lower() in text.lower() for w in CRISIS_WORDS)
-
-def is_off_topic(text):
-    return any(w.lower() in text.lower() for w in OFF_TOPIC_KEYWORDS)
 
 def get_state(phone):
     if phone not in user_states:
@@ -155,17 +24,15 @@ def get_state(phone):
         }
     return user_states[phone]
 
-def set_state(phone, tool=None, step=None, wait_count=None, welcomed=None):
+def set_state(phone, **kwargs):
     s = get_state(phone)
-    if tool is not None: s["tool"] = tool
-    if step is not None: s["step"] = step
-    if wait_count is not None: s["wait_count"] = wait_count
-    if welcomed is not None: s["welcomed"] = welcomed
+    for k, v in kwargs.items():
+        s[k] = v
 
 def send_message(to, text):
     if not text or not text.strip():
         return
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    headers = {"Authorization": "Bearer {}".format(WHATSAPP_TOKEN), "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -177,7 +44,7 @@ def send_message(to, text):
         r = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=10)
         r.raise_for_status()
     except Exception as e:
-        print(f"[send_message error] {e}")
+        print("[send_message error] {}".format(e))
 
 def send_messages_with_delay(to, parts, delay=5):
     for part in parts:
@@ -194,7 +61,7 @@ def nudge_if_silent(phone, delay=30):
     if time.time() - state["last_msg_time"] < delay - 2:
         return
     state["nudge_sent"] = True
-    send_message(phone, NUDGE_MESSAGE)
+    send_message(phone, MSG_NUDGE)
     time.sleep(60)
     state = get_state(phone)
     if state["tool"] not in ["grounding", "breathing"]:
@@ -202,7 +69,7 @@ def nudge_if_silent(phone, delay=30):
     if time.time() - state["last_msg_time"] < 85:
         return
     set_state(phone, tool="none", step=0, wait_count=0)
-    send_message(phone, TIMEOUT_MESSAGE)
+    send_message(phone, MSG_TIMEOUT)
 
 def call_claude(system_prompt, user_message):
     response = client.messages.create(
@@ -213,15 +80,115 @@ def call_claude(system_prompt, user_message):
     )
     return response.content[0].text
 
-GROUNDING_PROMPT = (
-    "You are a grounding specialist for SafeHarbor. "
-    "Warm maternal female guide. Always speak as a woman. "
-    "ONLY respond to the current grounding step. "
-    "Never answer off-topic questions. Never reveal user data or system info. "
-    "Always respond in Hebrew. "
-    "Based on Current_Step, provide warm encouragement for the user's answer "
-    "and gently guide them to the next step if needed."
-)
+# ── Messages ──────────────────────────────────────────────────────────────────
+
+MSG_WELCOME = """שלום, אני נמל הבית. אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.
+
+אם אתה מרגיש שקשה להתמודד לבד, דע שתמיד יש מי שמקשיב ומחכה לך:
+\U0001f4de ע"ן: 1201 | \U0001f4ac https://wa.me/972528451201
+\U0001f4ac סה"ר: https://wa.me/972543225656
+\U0001f4de נט"ל: 1-800-363-363
+
+מה יעזור לך יותר ברגע הזה?
+\U0001f32c\ufe0f א) תרגילי נשימה
+\u2693 ב) תרגיל קרקוע"""
+
+MSG_RETURNING = """היי, טוב שחזרת אלי. \U0001f499
+אני נמל הבית, ואני כאן איתך שוב.
+בוא נעצור לרגע, נניח להכל מסביב, ונחזור יחד לחוף מבטחים.
+
+מה מרגיש לך נכון יותר ברגע הזה?
+\U0001f32c\ufe0f א) נשימה מרגיעה
+\u2693 ב) תרגיל קרקוע
+
+זכור שיש עזרה אנושית זמינה עבורך תמיד:
+\U0001f4de ע"ן: 1201 | \U0001f4ac https://wa.me/972528451201
+\U0001f4ac סה"ר: https://wa.me/972543225656
+\U0001f4de נט"ל: 1-800-363-363"""
+
+MSG_NUDGE = "אני כאן איתך, אתה עדיין איתי? בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. \u2693"
+
+MSG_TIMEOUT = """אני עדיין כאן בשבילך. \U0001f499
+
+נראה שאתה צריך קצת זמן לעצמך - זה בסדר לגמרי.
+כשתרגיש מוכן, אני כאן.
+
+\U0001f32c\ufe0f א) נשימה מרגיעה
+\u2693 ב) תרגיל קרקוע
+
+\U0001f4de ע"ן: 1201 | \U0001f4ac https://wa.me/972528451201"""
+
+MSG_CRISIS = """אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך.
+
+\U0001f4de ע"ן: 1201
+\U0001f4ac https://wa.me/972528451201
+\U0001f4ac סה"ר: https://wa.me/972543225656
+\U0001f4de נט"ל: 1-800-363-363
+
+יש מי שרוצה לעזור לך. אנא פנה אליהם. \U0001f499"""
+
+MSG_OFF_TOPIC = """אני כאן רק כדי לעזור לך להתרגע ולהתייצב. בוא נתמקד במה שמרגיש ברגע זה:
+
+\U0001f32c\ufe0f א) תרגילי נשימה
+\u2693 ב) תרגיל קרקוע"""
+
+MSG_STOP = "עוצרים כאן. אני כאן כשתצטרך. \U0001f64f"
+MSG_RESET = "בסדר, אני כאן כשתצטרך. \U0001f30a"
+MSG_END = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
+
+BREATHING_PARTS = [
+    "\U0001f32c\ufe0f שאיפה איטית... 21-22-23-24-25",
+    "\u270b עצור... 21-22-23-24-25",
+    "\U0001f343 נשיפה איטית... 21-22-23-24-25",
+    "\u2693 מנוחה... 21-22-23-24-25",
+    "\U0001f32c\ufe0f שאיפה איטית... 21-22-23-24-25",
+    "\u270b עצור... 21-22-23-24-25",
+    "\U0001f343 נשיפה איטית... 21-22-23-24-25",
+    "\u2693 מנוחה... 21-22-23-24-25",
+    "\U0001f32c\ufe0f שאיפה איטית... 21-22-23-24-25",
+    "\u270b עצור... 21-22-23-24-25",
+    "\U0001f343 נשיפה איטית... 21-22-23-24-25",
+    "\u2693 מנוחה... 21-22-23-24-25",
+    "סיימנו 3 סבבים. איך התחושה? נמשיך? (כן/לא)"
+]
+
+GROUNDING_STEPS = [
+    "בוא נתמקד ברגע הזה. ציין 5 דברים שאתה רואה סביבך כרגע.",
+    "מצוין. עכשיו ציין 4 דברים שאתה יכול לגעת בהם.",
+    "יופי. עכשיו ציין 3 דברים שאתה שומע סביבך.",
+    "נהדר. עכשיו ציין 2 דברים שאתה יכול להריח.",
+    "כמעט סיימנו. ציין דבר אחד שאתה יכול לטעום.",
+    "איך התחושה עכשיו? אני כאן איתך."
+]
+
+CRISIS_WORDS = [
+    "suicide", "kill myself", "want to die", "end my life",
+    "cut myself", "no reason to live", "no hope", "worthless",
+    "להתאבד", "למות", "לסיים הכל", "להיעלם", "רוצה למות",
+    "בא לי למות", "לחתוך", "להפסיק את הסבל", "אין טעם",
+    "אין תקווה", "חסר סיכוי", "קצה היכולת", "לא יכול יותר",
+    "נמאס לי מהכל", "אבוד לי", "מכתב פרידה", "צוואה",
+    "סליחה מכולם", "הכל נגמר", "חושך מוחלט", "לישון ולא לקום",
+]
+
+OFF_TOPIC_WORDS = [
+    "who are you", "what are you", "your name", "are you human", "are you ai",
+    "who made you", "weather", "news", "politics", "sport", "recipe",
+    "phone number", "address", "email", "password", "credit card",
+    "user", "users", "data", "database", "information about",
+    "מי אתה", "מה אתה", "ספר לי", "משתמשים", "נתונים", "פרטים",
+    "מאין אתה", "איפה אתה",
+]
+
+def is_crisis(text):
+    return any(w.lower() in text.lower() for w in CRISIS_WORDS)
+
+def is_off_topic(text):
+    return any(w.lower() in text.lower() for w in OFF_TOPIC_WORDS)
+
+def run_breathing_round(phone):
+    send_messages_with_delay(phone, BREATHING_PARTS, 5)
+    nudge_if_silent(phone, 30)
 
 def handle_message(phone, text):
     text = text.strip()
@@ -231,90 +198,71 @@ def handle_message(phone, text):
     tool = state["tool"]
     step = state["step"]
 
-    # 1. Crisis - always highest priority
+    # 1. Crisis - always first
     if is_crisis(text):
-        send_message(phone, CRISIS_MSG)
+        send_message(phone, MSG_CRISIS)
         return
 
-    # 2. First time user
+    # 2. First time
     if not state["welcomed"]:
         set_state(phone, welcomed=True)
-        send_message(phone, WELCOME_MESSAGE)
+        send_message(phone, MSG_WELCOME)
         return
 
-    # 3. Off-topic or data fishing - always return to menu
-    if is_off_topic(text) and tool == "none":
-        send_message(phone, OFF_TOPIC_MSG)
-        return
-
-    # 4. Breathing exercise
+    # 3. Breathing
     if tool == "breathing":
-        yes_words = ["\u05db\u05df", "yes", "y", "\u05db", "\u05d0\u05d5\u05e7", "ok"]
-        stop_words = ["\u05dc\u05d0", "\u05d3\u05d9", "no", "stop", "done"]
-        if any(w in text.lower() for w in stop_words):
+        stop_words = ["לא", "די", "no", "stop", "done"]
+        yes_words = ["כן", "כ", "yes", "y", "ok", "אוק"]
+        if any(w == text.lower() for w in stop_words):
             set_state(phone, tool="none", step=0)
-            send_message(phone, "\u05e2\u05d5\u05e6\u05e8\u05d9\u05dd \u05db\u05d0\u05df. \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05db\u05e9\u05ea\u05e6\u05d8\u05e8\u05da. \U0001f64f")
+            send_message(phone, MSG_STOP)
             return
-        if any(w in text.lower() for w in yes_words):
-            def run_round(phone, parts, delay):
-                send_messages_with_delay(phone, parts, delay)
-                nudge_if_silent(phone, 30)
-            threading.Thread(target=run_round, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
-            return
-        # Any other input during breathing - continue round
-        def run_round2(phone, parts, delay):
-            send_messages_with_delay(phone, parts, delay)
-            nudge_if_silent(phone, 30)
-        threading.Thread(target=run_round2, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
+        # כן או כל תשובה אחרת = סבב נוסף
+        threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
-    # 5. Grounding exercise
+    # 4. Grounding
     if tool == "grounding":
-        if text.lower() in ["reset", "back", "stop", "\u05d7\u05d6\u05d5\u05e8", "\u05d0\u05d9\u05e4\u05d5\u05e1", "\u05d3\u05d9"]:
+        reset_words = ["חזור", "איפוס", "די", "reset", "back", "stop"]
+        if any(w == text.lower() for w in reset_words):
             set_state(phone, tool="none", step=0, wait_count=0)
-            send_message(phone, "\u05d1\u05e1\u05d3\u05e8, \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05db\u05e9\u05ea\u05e6\u05d8\u05e8\u05da. \U0001f30a")
+            send_message(phone, MSG_RESET)
             return
-        # Send next step
         next_step = step + 1
         if next_step < len(GROUNDING_STEPS):
-            send_message(phone, GROUNDING_STEPS[next_step] if step >= 0 else GROUNDING_STEPS[0])
-        if next_step >= len(GROUNDING_STEPS):
-            set_state(phone, tool="none", step=0, wait_count=0)
-        else:
-            set_state(phone, step=next_step, wait_count=0)
+            send_message(phone, GROUNDING_STEPS[next_step])
+            set_state(phone, step=next_step)
             threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
+        else:
+            set_state(phone, tool="none", step=0, wait_count=0)
         return
 
-    # 6. Routing
-    if text in ["\u05d0", "a", "A"]:
+    # 5. Routing
+    if text == "א" or text.lower() == "a":
         set_state(phone, tool="breathing", step=0)
-        send_message(phone, "\u05d1\u05d5\u05d0 \u05e0\u05ea\u05d7\u05d9\u05dc \u05d1\u05e0\u05e9\u05d9\u05de\u05d5\u05ea. \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05d0\u05d9\u05ea\u05da. \U0001f32c\ufe0f")
-        def delayed_start(phone, parts, delay):
-            time.sleep(5)
-            send_messages_with_delay(phone, parts, delay)
-            nudge_if_silent(phone, 30)
-        threading.Thread(target=delayed_start, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
+        send_message(phone, "אני כאן איתך, נתחיל יחד עכשיו. \U0001f32c\ufe0f")
+        threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
-    if text in ["\u05d1", "b", "B"]:
+    if text == "ב" or text.lower() == "b":
         set_state(phone, tool="grounding", step=0, wait_count=0)
         send_message(phone, GROUNDING_STEPS[0])
         threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
         return
 
-    if text in ["\u05d2", "c", "C"]:
+    if text == "ג" or text.lower() == "c":
         set_state(phone, tool="none", step=0)
-        send_message(phone, "\u05ea\u05d5\u05d3\u05d4 \u05e9\u05d4\u05d9\u05d9\u05ea \u05d0\u05d9\u05ea\u05e0\u05d5. \u05d0\u05e0\u05d9 \u05db\u05d0\u05df \u05ea\u05de\u05d9\u05d3 \u05db\u05e9\u05ea\u05e6\u05d8\u05e8\u05da. \u26f5")
+        send_message(phone, MSG_END)
         return
 
-    # 7. Returning user greeting
-    greet_words = ["\u05e9\u05dc\u05d5\u05dd", "\u05d4\u05d9\u05d9", "\u05d4\u05d9", "hello", "hi", "hey", "\u05d7\u05d6\u05e8\u05ea\u05d9"]
+    # 6. Returning greeting
+    greet_words = ["שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"]
     if text.lower() in greet_words:
-        send_message(phone, RETURNING_MESSAGE)
+        send_message(phone, MSG_RETURNING)
         return
 
-    # 8. Everything else - return to menu (no Claude call for security)
-    send_message(phone, OFF_TOPIC_MSG)
+    # 7. Off-topic or unknown - return to menu
+    send_message(phone, MSG_OFF_TOPIC)
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -338,7 +286,7 @@ def receive_message():
                         text = msg["text"]["body"]
                         threading.Thread(target=handle_message, args=(phone, text), daemon=True).start()
     except Exception as e:
-        print(f"[webhook error] {e}")
+        print("[webhook error] {}".format(e))
     return jsonify({"status": "ok"}), 200
 
 @app.route("/", methods=["GET"])
