@@ -26,31 +26,6 @@ def set_state(phone, tool=None, step=None, wait_count=None):
     if step is not None: s["step"] = step
     if wait_count is not None: s["wait_count"] = wait_count
 
-CRISIS_WORDS = [
-    "suicide", "kill myself", "want to die", "end my life", "no hope",
-    "cut myself", "cant go on", "goodbye forever", "worthless",
-]
-
-CRISIS_MESSAGE_HE = (
-    "אני מבינה שאתה עובר רגע קשה מאוד. אני כאן כדי לתמוך.\n\n"
-    "ערן: 1201\n"
-    "https://wa.me/972528451201\n"
-    "https://wa.me/972543225656\n"
-    "נטל: 1-800-363-363\n\n"
-    "יש מי שרוצה לעזור לך. אנא פנה אליהם."
-)
-
-CRISIS_MESSAGE_EN = (
-    "I understand you are going through a very difficult moment.\n\n"
-    "Crisis line: 988 (US) | 116 123 (UK)\n"
-    "Text HOME to 741741\n"
-    "https://findahelpline.com\n\n"
-    "There are people who want to help you. Please reach out."
-)
-
-def is_crisis(text):
-    return any(word.lower() in text.lower() for word in CRISIS_WORDS)
-
 def send_message(to, text):
     if not text or not text.strip():
         return
@@ -84,56 +59,23 @@ def call_claude(system_prompt, user_message):
     )
     return response.content[0].text
 
-ORCHESTRATOR_PROMPT = (
-    "You are SafeHarbor, a calm gentle female emotional support guide. "
-    "Always speak as a woman. Never do exercises yourself. "
-    "Respond in the same language the user writes in. "
-    "Greet warmly and ask: would you prefer A) Breathing or B) Grounding? "
-    "If Hebrew: use Hebrew naturally. If English: use English."
-)
+ORCHESTRATOR_PROMPT = "You are SafeHarbor, a calm gentle female emotional support guide. Always speak as a woman. Never do exercises yourself. Respond in the same language the user writes in. Greet warmly and offer: A) Breathing exercises or B) Grounding exercise. Ask them to type A or B."
 
-GROUNDING_PROMPT = (
-    "You are a grounding specialist. Female guide, gentle and supportive. "
-    "Never mention breathing. Respond in same language as user. "
-    "Step 0: ask for 5 things they see. "
-    "Step 1: 4 things to touch. "
-    "Step 2: 3 things to hear. "
-    "Step 3: 2 things to smell. "
-    "Step 4: 1 thing to taste. "
-    "Step 5: ask how they feel now. "
-    "Always respond based on Current_Step provided."
-)
+GROUNDING_PROMPT = "You are a grounding specialist. Female guide, gentle. Never mention breathing. Respond in same language as user. Step 0: ask for 5 things they see. Step 1: 4 things to touch. Step 2: 3 things to hear. Step 3: 2 things to smell. Step 4: 1 thing to taste. Step 5: ask how they feel now. Always respond based on Current_Step provided."
 
-BREATHING_HE = [
-    "אני כאן איתך, נתחיל יחד.",
-    "שאיפה... 1-2-3-4-5",
-    "עצור... 1-2-3-4-5",
-    "נשיפה... 1-2-3-4-5",
-    "מנוחה... 1-2-3-4-5",
-    "שאיפה... 1-2-3-4-5",
-    "עצור... 1-2-3-4-5",
-    "נשיפה... 1-2-3-4-5",
-    "מנוחה... 1-2-3-4-5",
-    "שאיפה... 1-2-3-4-5",
-    "עצור... 1-2-3-4-5",
-    "נשיפה... 1-2-3-4-5",
-    "מנוחה... 1-2-3-4-5",
-    "סיימנו 3 סבבים. איך התחושה? נמשיך? (כן/לא)"
-]
-
-BREATHING_EN = [
+BREATHING_PARTS = [
     "I am here with you, let us begin.",
-    "Breathe in... 1-2-3-4-5",
+    "Breathe in slowly... 1-2-3-4-5",
     "Hold... 1-2-3-4-5",
-    "Breathe out... 1-2-3-4-5",
+    "Breathe out slowly... 1-2-3-4-5",
     "Rest... 1-2-3-4-5",
-    "Breathe in... 1-2-3-4-5",
+    "Breathe in slowly... 1-2-3-4-5",
     "Hold... 1-2-3-4-5",
-    "Breathe out... 1-2-3-4-5",
+    "Breathe out slowly... 1-2-3-4-5",
     "Rest... 1-2-3-4-5",
-    "Breathe in... 1-2-3-4-5",
+    "Breathe in slowly... 1-2-3-4-5",
     "Hold... 1-2-3-4-5",
-    "Breathe out... 1-2-3-4-5",
+    "Breathe out slowly... 1-2-3-4-5",
     "Rest... 1-2-3-4-5",
     "3 rounds done. How do you feel? Continue? (yes/no)"
 ]
@@ -144,31 +86,19 @@ def handle_message(phone, text):
     tool = state["tool"]
     step = state["step"]
 
-    # Detect Hebrew
-    is_hebrew = any('\u05d0' <= c <= '\u05ea' for c in text)
-
-    # Crisis check - English words only to avoid encoding
-    if is_crisis(text):
-        msg = CRISIS_MESSAGE_HE if is_hebrew else CRISIS_MESSAGE_EN
-        send_message(phone, msg)
-        return
-
-    # Breathing
     if tool == "breathing":
-        stop_words = ["no", "stop", "enough", "done"]
-        if any(w in text.lower() for w in stop_words) or text in ["לא", "די"]:
+        stop_words = ["no", "stop", "enough", "done", "לא", "די"]
+        if any(w in text.lower() for w in stop_words):
             set_state(phone, tool="none", step=0)
-            send_message(phone, "עוצרים. אני כאן כשתצטרך." if is_hebrew else "Stopping. I am here when you need me.")
+            send_message(phone, "Stopping. I am here when you need me.")
             return
-        parts = BREATHING_HE if is_hebrew else BREATHING_EN
-        threading.Thread(target=send_messages_with_delay, args=(phone, parts, 5), daemon=True).start()
+        threading.Thread(target=send_messages_with_delay, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
         return
 
-    # Grounding
     if tool == "grounding":
-        if text in ["חזור", "איפוס", "reset", "back", "stop"]:
+        if text.lower() in ["reset", "back", "stop", "חזור", "איפוס"]:
             set_state(phone, tool="none", step=0, wait_count=0)
-            send_message(phone, "חוזרים. אני כאן." if is_hebrew else "OK, I am here.")
+            send_message(phone, "OK, I am here.")
             return
         user_msg = f"Current_Step: {step}\nUser_Input: {text}"
         response = call_claude(GROUNDING_PROMPT, user_msg)
@@ -180,20 +110,14 @@ def handle_message(phone, text):
             set_state(phone, step=new_step, wait_count=0)
         return
 
-    # Routing
-    if text in ["א", "a", "A"]:
+    if text.lower() in ["א", "a"]:
         set_state(phone, tool="breathing", step=0)
-        send_message(phone, "מוכן? בוא נתחיל." if is_hebrew else "Ready? Let us begin.")
+        send_message(phone, "Ready? Let us begin breathing together.")
         return
 
-    if text in ["ב", "b", "B"]:
+    if text.lower() in ["ב", "b"]:
         set_state(phone, tool="grounding", step=0, wait_count=0)
-        send_message(phone, "בוא נתחיל בקרקוע." if is_hebrew else "Let us begin grounding.")
-        return
-
-    if text in ["ג", "c", "C"]:
-        set_state(phone, tool="none", step=0)
-        send_message(phone, "תודה. אני כאן תמיד." if is_hebrew else "Thank you. I am always here.")
+        send_message(phone, "Let us begin the grounding exercise. Ready?")
         return
 
     response = call_claude(ORCHESTRATOR_PROMPT, text)
