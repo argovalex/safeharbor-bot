@@ -64,12 +64,9 @@ def get_crisis_message(lang):
     )
 
 def send_message(to, text):
+    import json as _json, urllib.request as _urllib
     if not text or not text.strip():
         return
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -78,8 +75,12 @@ def send_message(to, text):
         "text": {"body": text.strip()}
     }
     try:
-        r = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=10)
-        r.raise_for_status()
+        body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = _urllib.Request(WHATSAPP_API_URL, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {WHATSAPP_TOKEN}")
+        req.add_header("Content-Type", "application/json")
+        with _urllib.urlopen(req, timeout=10) as resp:
+            pass
     except Exception as e:
         print(f"[send_message error] {e}", flush=True)
 
