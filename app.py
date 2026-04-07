@@ -53,7 +53,7 @@ def send_messages_with_delay(to, parts, delay=5):
 
 def call_claude(system_prompt, user_message):
     response = client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=512,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}]
