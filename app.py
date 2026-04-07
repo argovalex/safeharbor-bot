@@ -59,12 +59,31 @@ def call_claude(system_prompt, user_message):
     )
     return response.content[0].text
 
-ORCHESTRATOR_PROMPT = "You are SafeHarbor, a calm gentle female emotional support guide. Always speak as a woman. Never do exercises yourself. Respond in the same language the user writes in. Greet warmly and offer: A) Breathing exercises or B) Grounding exercise. Ask them to type A or B."
+ORCHESTRATOR_PROMPT = (
+    "You are SafeHarbor, a calm gentle female emotional support guide. "
+    "Always speak as a woman. Never perform exercises yourself. "
+    "Respond in the same language the user writes in. "
+    "Welcome warmly and offer two options: "
+    "A) Breathing exercises or B) Grounding exercise. "
+    "Ask them to type A or B. "
+    "If user mentions crisis or self-harm, provide hotline numbers immediately."
+)
 
-GROUNDING_PROMPT = "You are a grounding specialist. Female guide, gentle. Never mention breathing. Respond in same language as user. Step 0: ask for 5 things they see. Step 1: 4 things to touch. Step 2: 3 things to hear. Step 3: 2 things to smell. Step 4: 1 thing to taste. Step 5: ask how they feel now. Always respond based on Current_Step provided."
+GROUNDING_PROMPT = (
+    "You are a grounding specialist. Female guide, gentle and supportive. "
+    "Never mention breathing. Respond in same language as user. "
+    "Based on Current_Step: "
+    "0: ask for 5 things they see. "
+    "1: 4 things they can touch. "
+    "2: 3 things they hear. "
+    "3: 2 things they smell. "
+    "4: 1 thing they taste. "
+    "5: ask how they feel now, say you are here with them. "
+    "Always respond based ONLY on the Current_Step provided."
+)
 
 BREATHING_PARTS = [
-    "I am here with you, let us begin.",
+    "I am here with you, let us begin together.",
     "Breathe in slowly... 1-2-3-4-5",
     "Hold... 1-2-3-4-5",
     "Breathe out slowly... 1-2-3-4-5",
@@ -80,25 +99,51 @@ BREATHING_PARTS = [
     "3 rounds done. How do you feel? Continue? (yes/no)"
 ]
 
+CRISIS_WORDS = [
+    "suicide", "kill myself", "want to die", "end my life",
+    "cut myself", "no reason to live", "cant go on",
+    "no hope", "worthless", "goodbye forever",
+]
+
+CRISIS_MSG = (
+    "I understand you are going through a very difficult moment. "
+    "Please reach out for help right now.\n\n"
+    "Crisis line: 988 (US) | 116 123 (UK)\n"
+    "Text HOME to 741741\n"
+    "https://findahelpline.com\n\n"
+    "There are people who want to help you. Please contact them now."
+)
+
+def is_crisis(text):
+    return any(w in text.lower() for w in CRISIS_WORDS)
+
 def handle_message(phone, text):
     text = text.strip()
     state = get_state(phone)
     tool = state["tool"]
     step = state["step"]
 
+    if is_crisis(text):
+        send_message(phone, CRISIS_MSG)
+        return
+
     if tool == "breathing":
         stop_words = ["no", "stop", "enough", "done", "לא", "די"]
         if any(w in text.lower() for w in stop_words):
             set_state(phone, tool="none", step=0)
-            send_message(phone, "Stopping. I am here when you need me.")
+            send_message(phone, "Stopping here. I am here when you need me.")
             return
-        threading.Thread(target=send_messages_with_delay, args=(phone, BREATHING_PARTS, 5), daemon=True).start()
+        threading.Thread(
+            target=send_messages_with_delay,
+            args=(phone, BREATHING_PARTS, 5),
+            daemon=True
+        ).start()
         return
 
     if tool == "grounding":
-        if text.lower() in ["reset", "back", "stop", "חזור", "איפוס"]:
+        if text.lower() in ["reset", "back", "stop", "חזור", "איפוס", "די"]:
             set_state(phone, tool="none", step=0, wait_count=0)
-            send_message(phone, "OK, I am here.")
+            send_message(phone, "OK, I am here when you need me.")
             return
         user_msg = f"Current_Step: {step}\nUser_Input: {text}"
         response = call_claude(GROUNDING_PROMPT, user_msg)
@@ -118,6 +163,11 @@ def handle_message(phone, text):
     if text.lower() in ["ב", "b"]:
         set_state(phone, tool="grounding", step=0, wait_count=0)
         send_message(phone, "Let us begin the grounding exercise. Ready?")
+        return
+
+    if text.lower() in ["ג", "c"]:
+        set_state(phone, tool="none", step=0)
+        send_message(phone, "Thank you. I am always here when you need me.")
         return
 
     response = call_claude(ORCHESTRATOR_PROMPT, text)
@@ -143,7 +193,11 @@ def receive_message():
                     if msg.get("type") == "text":
                         phone = msg["from"]
                         text = msg["text"]["body"]
-                        threading.Thread(target=handle_message, args=(phone, text), daemon=True).start()
+                        threading.Thread(
+                            target=handle_message,
+                            args=(phone, text),
+                            daemon=True
+                        ).start()
     except Exception as e:
         print(f"[webhook error] {e}")
     return jsonify({"status": "ok"}), 200
