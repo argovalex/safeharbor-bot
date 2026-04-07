@@ -92,11 +92,7 @@ def send_messages_with_delay(to, parts, delay=5):
 
 def call_claude(system_prompt, user_message):
     import json as _json
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json; charset=utf-8"
-    }
+    import urllib.request as _urllib
     payload = {
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
@@ -105,14 +101,17 @@ def call_claude(system_prompt, user_message):
     }
     try:
         body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        r = requests.post(
+        req = _urllib.Request(
             "https://api.anthropic.com/v1/messages",
-            headers=headers,
             data=body,
-            timeout=30
+            method="POST"
         )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
+        req.add_header("x-api-key", ANTHROPIC_API_KEY)
+        req.add_header("anthropic-version", "2023-06-01")
+        req.add_header("content-type", "application/json")
+        with _urllib.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read().decode("utf-8"))
+            return result["content"][0]["text"]
     except Exception as e:
         print(f"[claude error] {e}", flush=True)
         return ""
