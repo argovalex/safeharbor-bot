@@ -1,4 +1,4 @@
-# v15 - Grounding: updated steps text, wait_count nudge logic (60s x3), המשך command, menu after step 5
+# v16 - Fix: wait_count missing from default state caused grounding to crash and show off-topic
 import os
 import time
 import json
@@ -42,8 +42,10 @@ def get_state(phone):
             _all_states[phone] = {
                 "tool": "none", "step": 0,
                 "welcomed": False, "round_id": 0,
-                "last_msg_time": 0
+                "last_msg_time": 0, "wait_count": 0
             }
+        # Ensure wait_count exists in older saved states
+        _all_states[phone].setdefault("wait_count", 0)
         return dict(_all_states[phone])   # return a COPY to avoid race conditions
 
 def set_state(phone, **kwargs):
@@ -51,8 +53,9 @@ def set_state(phone, **kwargs):
         s = _all_states.setdefault(phone, {
             "tool": "none", "step": 0,
             "welcomed": False, "round_id": 0,
-            "last_msg_time": 0
+            "last_msg_time": 0, "wait_count": 0
         })
+        s.setdefault("wait_count", 0)
         s.update(kwargs)
         save_states(_all_states)
 
