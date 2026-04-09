@@ -131,7 +131,6 @@ MSG_OFF_TOPIC = (
 
 MSG_BREATHING_STOP = "אני כאן אם תצטרך אותי שוב. שמור על עצמך. \U0001f499"
 MSG_RESET          = "בסדר, אני כאן כשתצטרך. \U0001f30a"
-MSG_END            = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
 BREATHING_START    = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 BREATHING_PARTS = [
@@ -303,10 +302,6 @@ def handle_message(phone, text):
         ).start()
         return
 
-    if text == "ג" or t == "c":
-        set_state(phone, tool="none", step=0)
-        send_message(phone, MSG_END)
-        return
 
     # 6. Greeting
     if t in GREET_WORDS:
