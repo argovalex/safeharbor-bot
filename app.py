@@ -1,4 +1,4 @@
-# v12 - Fix: persist welcomed state across restarts using a simple file-based store
+# v13 - Full persistent state (tool+round_id saved to disk, survives restarts)
 import os
 import time
 import json
@@ -8,56 +8,54 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
+WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "12345")
-WHATSAPP_API_URL = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
+VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
+WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 
-# ── Persistent storage for welcomed users ─────────────────────────────────────
-WELCOMED_FILE = "/tmp/welcomed_users.json"
-_welcomed_lock = threading.Lock()
+STATE_FILE = "/tmp/user_states.json"
+_state_lock = threading.Lock()
 
-def load_welcomed():
+# ── Persistent state ──────────────────────────────────────────────────────────
+
+def load_states():
     try:
-        if os.path.exists(WELCOMED_FILE):
-            with open(WELCOMED_FILE, "r") as f:
-                return set(json.load(f))
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
         pass
-    return set()
+    return {}
 
-def save_welcomed(welcomed_set):
+def save_states(states):
     try:
-        with open(WELCOMED_FILE, "w") as f:
-            json.dump(list(welcomed_set), f)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(states, f, ensure_ascii=False)
     except Exception as e:
-        print("[save_welcomed error] {}".format(e))
+        print("[save_states error] {}".format(e))
 
-welcomed_users = load_welcomed()
-
-def mark_welcomed(phone):
-    with _welcomed_lock:
-        welcomed_users.add(phone)
-        save_welcomed(welcomed_users)
-
-def is_welcomed(phone):
-    return phone in welcomed_users
-
-# ── In-memory session state (tool/step/round — OK to reset on restart) ────────
-user_states = {}
+# Load once at startup
+_all_states = load_states()
 
 def get_state(phone):
-    if phone not in user_states:
-        user_states[phone] = {
-            "tool": "none", "step": 0, "wait_count": 0,
-            "last_msg_time": 0, "nudge_sent": False, "round_id": 0
-        }
-    return user_states[phone]
+    with _state_lock:
+        if phone not in _all_states:
+            _all_states[phone] = {
+                "tool": "none", "step": 0,
+                "welcomed": False, "round_id": 0,
+                "last_msg_time": 0, "nudge_sent": False
+            }
+        return _all_states[phone]
 
 def set_state(phone, **kwargs):
-    s = get_state(phone)
-    for k, v in kwargs.items():
-        s[k] = v
+    with _state_lock:
+        s = _all_states.setdefault(phone, {
+            "tool": "none", "step": 0,
+            "welcomed": False, "round_id": 0,
+            "last_msg_time": 0, "nudge_sent": False
+        })
+        s.update(kwargs)
+        save_states(_all_states)
 
 # ── WhatsApp sender ───────────────────────────────────────────────────────────
 
@@ -103,8 +101,7 @@ MSG_WELCOME = (
 
 MSG_RETURNING = (
     'היי, טוב שחזרת אלי. \U0001f499\n'
-    'אני נמל הבית, ואני כאן איתך שוב.\n'
-    'בוא נעצור לרגע, נניח להכל מסביב, ונחזור יחד לחוף מבטחים.\n\n'
+    'אני נמל הבית, ואני כאן איתך שוב.\n\n'
     'מה מרגיש לך נכון יותר ברגע הזה?\n'
     '\U0001f32c\ufe0f א) נשימה מרגיעה\n'
     '\u2693 ב) תרגיל קרקוע\n\n'
@@ -114,7 +111,10 @@ MSG_RETURNING = (
     '\U0001f4de נט"ל: 1-800-363-363'
 )
 
-MSG_NUDGE = "אני כאן איתך, אתה עדיין איתי? בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. \u2693"
+MSG_NUDGE = (
+    "אני כאן איתך, אתה עדיין איתי? "
+    "בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. \u2693"
+)
 
 MSG_CRISIS = (
     'אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך.\n\n'
@@ -132,9 +132,8 @@ MSG_OFF_TOPIC = (
 )
 
 MSG_BREATHING_STOP = "אני כאן אם תצטרך אותי שוב. שמור על עצמך. \U0001f499"
-MSG_RESET  = "בסדר, אני כאן כשתצטרך. \U0001f30a"
-MSG_END    = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
-
+MSG_RESET          = "בסדר, אני כאן כשתצטרך. \U0001f30a"
+MSG_END            = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
 BREATHING_START_MSG = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 BREATHING_PARTS = [
@@ -181,8 +180,9 @@ OFF_TOPIC_WORDS = [
     "מאין אתה","איפה אתה",
 ]
 
+# STOP = exact lowercase match; anything else = new round
 BREATHING_STOP_WORDS = {"לא", "ל", "no", "n", "די", "stop", "done"}
-GREET_WORDS = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
+GREET_WORDS          = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
 
 def is_crisis(text):
     return any(w.lower() in text.lower() for w in CRISIS_WORDS)
@@ -190,81 +190,90 @@ def is_crisis(text):
 # ── Breathing threads ─────────────────────────────────────────────────────────
 
 def breathing_post_round_wait(phone, my_round_id):
-    """30s → nudge. 60s more → nudge again. Aborts if round_id changes."""
+    """30s → nudge. 60s more → nudge again. Aborts if round_id changed or tool changed."""
     time.sleep(30)
-    state = get_state(phone)
-    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+    s = get_state(phone)
+    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
         return
     send_message(phone, MSG_NUDGE)
 
     time.sleep(60)
-    state = get_state(phone)
-    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+    s = get_state(phone)
+    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
         return
     send_message(phone, MSG_NUDGE)
 
 def run_breathing_round(phone):
-    state = get_state(phone)
-    my_round_id = state["round_id"]
+    """Send 12 breathing messages + final question, then start post-round watcher."""
+    s = get_state(phone)
+    my_round_id = s.get("round_id", 0)
+
     send_messages_with_delay(phone, BREATHING_PARTS, 5)
-    state = get_state(phone)
-    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+
+    # Check round is still active after sending
+    s = get_state(phone)
+    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
         return
-    state["last_msg_time"] = time.time()
-    state["nudge_sent"] = False
+
+    # Mark time and start watcher
+    set_state(phone, last_msg_time=time.time(), nudge_sent=False)
     threading.Thread(
-        target=breathing_post_round_wait, args=(phone, my_round_id), daemon=True
+        target=breathing_post_round_wait,
+        args=(phone, my_round_id),
+        daemon=True
     ).start()
 
 # ── Grounding nudge ───────────────────────────────────────────────────────────
 
 def nudge_if_silent(phone, delay=30):
     time.sleep(delay)
-    state = get_state(phone)
-    if state["tool"] != "grounding" or state["nudge_sent"]:
+    s = get_state(phone)
+    if s.get("tool") != "grounding" or s.get("nudge_sent"):
         return
-    if time.time() - state["last_msg_time"] < delay - 2:
+    if time.time() - s.get("last_msg_time", 0) < delay - 2:
         return
-    state["nudge_sent"] = True
+    set_state(phone, nudge_sent=True)
     send_message(phone, MSG_NUDGE)
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 def handle_message(phone, text):
     text = text.strip()
-    state = get_state(phone)
-    state["last_msg_time"] = time.time()
-    state["nudge_sent"] = False
-    tool  = state["tool"]
-    step  = state["step"]
-    t     = text.lower()
+    t    = text.lower()
+
+    # Update last_msg_time and nudge_sent immediately
+    set_state(phone, last_msg_time=time.time(), nudge_sent=False)
+
+    s    = get_state(phone)
+    tool = s.get("tool", "none")
+    step = s.get("step", 0)
 
     # 1. Crisis — always first
     if is_crisis(text):
         send_message(phone, MSG_CRISIS)
         return
 
-    # 2. First-ever message → welcome (persisted across restarts)
-    if not is_welcomed(phone):
-        mark_welcomed(phone)
+    # 2. First-ever message
+    if not s.get("welcomed", False):
+        set_state(phone, welcomed=True)
         send_message(phone, MSG_WELCOME)
         return
 
-    # 3. Breathing — intercept ALL input before any other logic
+    # 3. Breathing — intercept ALL input
     if tool == "breathing":
         if t in BREATHING_STOP_WORDS:
             set_state(phone, tool="none", step=0, round_id=0)
             send_message(phone, MSG_BREATHING_STOP)
         else:
-            # Any other input = new round
-            state["round_id"] = state.get("round_id", 0) + 1
+            new_round = s.get("round_id", 0) + 1
+            set_state(phone, round_id=new_round)
             threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
-    # 4. Grounding — intercept ALL input before routing
+    # 4. Grounding — intercept ALL input
     if tool == "grounding":
         if t in {"חזור", "איפוס", "די", "reset", "back", "stop"}:
-            set_state(phone, tool="none", step=0, wait_count=0)
+            set_state(phone, tool="none", step=0)
             send_message(phone, MSG_RESET)
             return
         next_step = step + 1
@@ -273,19 +282,19 @@ def handle_message(phone, text):
             set_state(phone, step=next_step)
             threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
         else:
-            set_state(phone, tool="none", step=0, wait_count=0)
+            set_state(phone, tool="none", step=0)
         return
 
     # 5. Routing (tool == "none")
     if text == "א" or t == "a":
-        new_round = state.get("round_id", 0) + 1
+        new_round = s.get("round_id", 0) + 1
         set_state(phone, tool="breathing", step=0, round_id=new_round)
         send_message(phone, BREATHING_START_MSG)
         threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
     if text == "ב" or t == "b":
-        set_state(phone, tool="grounding", step=0, wait_count=0)
+        set_state(phone, tool="grounding", step=0)
         send_message(phone, GROUNDING_STEPS[0])
         threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
         return
@@ -326,7 +335,9 @@ def receive_message():
                         phone = msg["from"]
                         text  = msg["text"]["body"]
                         threading.Thread(
-                            target=handle_message, args=(phone, text), daemon=True
+                            target=handle_message,
+                            args=(phone, text),
+                            daemon=True
                         ).start()
     except Exception as e:
         print("[webhook error] {}".format(e))
