@@ -1,4 +1,4 @@
-# v18 - Fix: grounding_session kills stale nudge threads; STATE_FILE saved next to app
+# v19 - Cleanup: removed unused GROUNDING_MIN_WORDS
 import os
 import time
 import json
@@ -163,9 +163,6 @@ GROUNDING_STEPS = [
     "ודבר אחד שאתה יכול לטעום (או טעם שמרגיע אותך).",
     "איך התחושה עכשיו?"
 ]
-
-# Required word count per step (minimum words the user must provide)
-GROUNDING_MIN_WORDS = [5, 4, 3, 2, 1, 1]
 
 # Phrases that look like conversation rather than grounding answers
 GROUNDING_CHAT_PHRASES = [
