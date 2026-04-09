@@ -1,4 +1,4 @@
-# v14 - Fix: nudge thread stops immediately when tool changes to none
+# v15 - Grounding: updated steps text, wait_count nudge logic (60s x3), המשך command, menu after step 5
 import os
 import time
 import json
@@ -151,12 +151,16 @@ BREATHING_PARTS = [
 
 GROUNDING_STEPS = [
     "בוא נתמקד ברגע הזה. ציין 5 דברים שאתה רואה סביבך כרגע.",
-    "מצוין. עכשיו ציין 4 דברים שאתה יכול לגעת בהם.",
-    "יופי. עכשיו ציין 3 דברים שאתה שומע סביבך.",
-    "נהדר. עכשיו ציין 2 דברים שאתה יכול להריח.",
-    "כמעט סיימנו. ציין דבר אחד שאתה יכול לטעום.",
+    "מצוין. עכשיו, 4 דברים שאתה יכול לגעת בהם כרגע.",
+    "יופי. עכשיו, 3 דברים שאתה שומע סביבך.",
+    "מעולה. עכשיו, 2 דברים שאתה יכול להריח.",
+    "ודבר אחד שאתה יכול לטעום (או טעם שמרגיע אותך).",
     "איך התחושה עכשיו? אני כאן איתך."
 ]
+
+GROUNDING_NUDGE_1 = "אני כאן איתך. מצאת משהו אחד?"
+GROUNDING_NUDGE_2 = "אני כאן איתך. מצאת משהו אחד?"
+GROUNDING_NUDGE_3 = "נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן. כתוב 'המשך' או 'איפוס'."
 
 CRISIS_WORDS = [
     "suicide","kill myself","want to die","end my life","cut myself",
@@ -220,16 +224,23 @@ def run_breathing_round(phone):
         daemon=True
     ).start()
 
-# ── Grounding nudge ───────────────────────────────────────────────────────────
+# ── Grounding nudge (60s intervals, wait_count based) ────────────────────────
 
-def nudge_if_silent_grounding(phone, my_step, delay=30):
-    time.sleep(delay)
-    s = get_state(phone)
-    if s["tool"] != "grounding" or s["step"] != my_step:
-        return
-    if time.time() - s.get("last_msg_time", 0) < delay - 2:
-        return
-    send_message(phone, MSG_NUDGE)
+def nudge_if_silent_grounding(phone, my_step):
+    """Sends nudges at 60s intervals if user hasn't responded. Uses wait_count."""
+    for count in range(1, 4):
+        time.sleep(60)
+        s = get_state(phone)
+        # Stop if tool changed or user advanced to next step
+        if s["tool"] != "grounding" or s["step"] != my_step:
+            return
+        wait_count = s.get("wait_count", 0) + 1
+        set_state(phone, wait_count=wait_count)
+        if wait_count <= 2:
+            send_message(phone, GROUNDING_NUDGE_1)
+        else:
+            send_message(phone, GROUNDING_NUDGE_3)
+            return  # No more nudges after wait_count >= 3
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
@@ -269,21 +280,32 @@ def handle_message(phone, text):
 
     # 4. Grounding — catches ALL input before routing
     if tool == "grounding":
-        if t in {"חזור", "איפוס", "די", "reset", "back", "stop"}:
-            set_state(phone, tool="none", step=0)
+        reset_words = {"חזור", "איפוס", "reset", "back", "stop"}
+        # "המשך" = continue from where we are (re-send current step prompt)
+        if t == "המשך":
+            set_state(phone, wait_count=0)
+            send_message(phone, GROUNDING_STEPS[step])
+            threading.Thread(
+                target=nudge_if_silent_grounding, args=(phone, step), daemon=True
+            ).start()
+            return
+        if t in reset_words or t == "די":
+            set_state(phone, tool="none", step=0, wait_count=0)
             send_message(phone, MSG_RESET)
             return
+        # Any other input = advance to next step
+        set_state(phone, wait_count=0)
         next_step = step + 1
         if next_step < len(GROUNDING_STEPS):
             send_message(phone, GROUNDING_STEPS[next_step])
             set_state(phone, step=next_step)
             threading.Thread(
-                target=nudge_if_silent_grounding,
-                args=(phone, next_step, 30),
-                daemon=True
+                target=nudge_if_silent_grounding, args=(phone, next_step), daemon=True
             ).start()
         else:
-            set_state(phone, tool="none", step=0)
+            # Step 5 completed → back to menu
+            set_state(phone, tool="none", step=0, wait_count=0)
+            send_message(phone, MSG_RETURNING)
         return
 
     # 5. Routing
@@ -295,10 +317,10 @@ def handle_message(phone, text):
         return
 
     if text == "ב" or t == "b":
-        set_state(phone, tool="grounding", step=0)
+        set_state(phone, tool="grounding", step=0, wait_count=0)
         send_message(phone, GROUNDING_STEPS[0])
         threading.Thread(
-            target=nudge_if_silent_grounding, args=(phone, 0, 30), daemon=True
+            target=nudge_if_silent_grounding, args=(phone, 0), daemon=True
         ).start()
         return
 
