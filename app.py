@@ -1,4 +1,4 @@
-# v25 - UI: bold text, ☎️ phone emoji, ⬅️➡️ breathing arrows, grounding emojis per step
+# v26 - Logo sent on first welcome, ⚓ replaces 🏠 in welcome message
 import os
 import time
 import json
@@ -187,6 +187,8 @@ def rate_limit_check(phone):
         _rate_counters[phone].append(now)
         return False
 
+LOGO_URL = "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png"
+
 # Guardian-wrapped send_message
 def send_message(to, text):
     """Send only if text is a known valid bot response."""
@@ -210,6 +212,25 @@ def send_message(to, text):
         r.raise_for_status()
     except Exception as e:
         print("[send_message error] {}".format(e))
+
+def send_logo(to):
+    """Send the SafeHarbor logo image as welcome visual."""
+    headers = {
+        "Authorization": "Bearer {}".format(WHATSAPP_TOKEN),
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "image",
+        "image": {"link": LOGO_URL}
+    }
+    try:
+        r = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print("[send_logo error] {}".format(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── PERSISTENT STATE ──────────────────────────────────────────────────────────
@@ -278,7 +299,7 @@ threading.Thread(target=_background_flusher, daemon=True).start()
 # ══════════════════════════════════════════════════════════════════════════════
 
 MSG_WELCOME = (
-    '*שלום, אני נמל הבית* 🏠\n'
+    '*שלום, אני נמל הבית* \u2693\n'
     'אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.\n\n'
     'אם אתה מרגיש שקשה להתמודד לבד, דע שתמיד יש מי שמקשיב ומחכה לך:\n'
     '☎️ ער"ן: 1201 | \U0001f4ac https://wa.me/972528451201\n'
@@ -466,6 +487,7 @@ def handle_message(phone, text):
     # First message
     if not s["welcomed"]:
         set_state(phone, welcomed=True, force_save=True)
+        send_logo(phone)
         send_message(phone, MSG_WELCOME)
         return
 
