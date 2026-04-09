@@ -1,4 +1,4 @@
-# v13 - Full persistent state (tool+round_id saved to disk, survives restarts)
+# v14 - Fix: nudge thread stops immediately when tool changes to none
 import os
 import time
 import json
@@ -13,7 +13,7 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
 WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 
-STATE_FILE = "/tmp/user_states.json"
+STATE_FILE  = "/tmp/user_states.json"
 _state_lock = threading.Lock()
 
 # ── Persistent state ──────────────────────────────────────────────────────────
@@ -34,7 +34,6 @@ def save_states(states):
     except Exception as e:
         print("[save_states error] {}".format(e))
 
-# Load once at startup
 _all_states = load_states()
 
 def get_state(phone):
@@ -43,16 +42,16 @@ def get_state(phone):
             _all_states[phone] = {
                 "tool": "none", "step": 0,
                 "welcomed": False, "round_id": 0,
-                "last_msg_time": 0, "nudge_sent": False
+                "last_msg_time": 0
             }
-        return _all_states[phone]
+        return dict(_all_states[phone])   # return a COPY to avoid race conditions
 
 def set_state(phone, **kwargs):
     with _state_lock:
         s = _all_states.setdefault(phone, {
             "tool": "none", "step": 0,
             "welcomed": False, "round_id": 0,
-            "last_msg_time": 0, "nudge_sent": False
+            "last_msg_time": 0
         })
         s.update(kwargs)
         save_states(_all_states)
@@ -69,8 +68,7 @@ def send_message(to, text):
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": to,
-        "type": "text",
+        "to": to, "type": "text",
         "text": {"body": text.strip()}
     }
     try:
@@ -81,9 +79,9 @@ def send_message(to, text):
 
 def send_messages_with_delay(to, parts, delay=5):
     for part in parts:
-        part = part.strip()
-        if part:
-            send_message(to, part)
+        p = part.strip()
+        if p:
+            send_message(to, p)
             time.sleep(delay)
 
 # ── Messages ──────────────────────────────────────────────────────────────────
@@ -134,7 +132,7 @@ MSG_OFF_TOPIC = (
 MSG_BREATHING_STOP = "אני כאן אם תצטרך אותי שוב. שמור על עצמך. \U0001f499"
 MSG_RESET          = "בסדר, אני כאן כשתצטרך. \U0001f30a"
 MSG_END            = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
-BREATHING_START_MSG = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
+BREATHING_START    = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 BREATHING_PARTS = [
     "\U0001f32c\ufe0f שאיפה איטית... 21-22-23-24-25",
@@ -171,16 +169,6 @@ CRISIS_WORDS = [
     "חושך מוחלט","לישון ולא לקום",
 ]
 
-OFF_TOPIC_WORDS = [
-    "who are you","what are you","your name","are you human","are you ai",
-    "who made you","weather","news","politics","sport","recipe",
-    "phone number","address","email","password","credit card",
-    "user","users","data","database","information about",
-    "מי אתה","מה אתה","ספר לי","משתמשים","נתונים","פרטים",
-    "מאין אתה","איפה אתה",
-]
-
-# STOP = exact lowercase match; anything else = new round
 BREATHING_STOP_WORDS = {"לא", "ל", "no", "n", "די", "stop", "done"}
 GREET_WORDS          = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
 
@@ -190,33 +178,43 @@ def is_crisis(text):
 # ── Breathing threads ─────────────────────────────────────────────────────────
 
 def breathing_post_round_wait(phone, my_round_id):
-    """30s → nudge. 60s more → nudge again. Aborts if round_id changed or tool changed."""
+    """
+    Waits after a round ends. Sends nudge at 30s and 60s only if:
+    - tool is still 'breathing'  AND
+    - round_id hasn't changed (no new round started)
+    Both conditions must hold at the moment of checking.
+    """
     time.sleep(30)
     s = get_state(phone)
-    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
-        return
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+        return                          # user replied or stopped → abort
     send_message(phone, MSG_NUDGE)
 
     time.sleep(60)
     s = get_state(phone)
-    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
-        return
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+        return                          # user replied or stopped → abort
     send_message(phone, MSG_NUDGE)
 
 def run_breathing_round(phone):
-    """Send 12 breathing messages + final question, then start post-round watcher."""
     s = get_state(phone)
-    my_round_id = s.get("round_id", 0)
+    my_round_id = s["round_id"]
 
-    send_messages_with_delay(phone, BREATHING_PARTS, 5)
+    # Send first 12 parts with 5s delay between them
+    # Do NOT sleep after the last message (the question) — user may reply immediately
+    for i, part in enumerate(BREATHING_PARTS):
+        s = get_state(phone)
+        if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+            return
+        send_message(phone, part)
+        if i < len(BREATHING_PARTS) - 1:   # sleep between messages, NOT after the last
+            time.sleep(5)
 
-    # Check round is still active after sending
+    # Round finished — start watcher only if still in same round
     s = get_state(phone)
-    if s.get("tool") != "breathing" or s.get("round_id") != my_round_id:
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
-
-    # Mark time and start watcher
-    set_state(phone, last_msg_time=time.time(), nudge_sent=False)
+    set_state(phone, last_msg_time=time.time())
     threading.Thread(
         target=breathing_post_round_wait,
         args=(phone, my_round_id),
@@ -225,14 +223,13 @@ def run_breathing_round(phone):
 
 # ── Grounding nudge ───────────────────────────────────────────────────────────
 
-def nudge_if_silent(phone, delay=30):
+def nudge_if_silent_grounding(phone, my_step, delay=30):
     time.sleep(delay)
     s = get_state(phone)
-    if s.get("tool") != "grounding" or s.get("nudge_sent"):
+    if s["tool"] != "grounding" or s["step"] != my_step:
         return
     if time.time() - s.get("last_msg_time", 0) < delay - 2:
         return
-    set_state(phone, nudge_sent=True)
     send_message(phone, MSG_NUDGE)
 
 # ── Main handler ──────────────────────────────────────────────────────────────
@@ -241,36 +238,37 @@ def handle_message(phone, text):
     text = text.strip()
     t    = text.lower()
 
-    # Update last_msg_time and nudge_sent immediately
-    set_state(phone, last_msg_time=time.time(), nudge_sent=False)
+    set_state(phone, last_msg_time=time.time())
 
     s    = get_state(phone)
-    tool = s.get("tool", "none")
-    step = s.get("step", 0)
+    tool = s["tool"]
+    step = s["step"]
 
-    # 1. Crisis — always first
+    # 1. Crisis
     if is_crisis(text):
         send_message(phone, MSG_CRISIS)
         return
 
-    # 2. First-ever message
-    if not s.get("welcomed", False):
+    # 2. First message ever
+    if not s["welcomed"]:
         set_state(phone, welcomed=True)
         send_message(phone, MSG_WELCOME)
         return
 
-    # 3. Breathing — intercept ALL input
+    # 3. Breathing — catches ALL input before anything else
     if tool == "breathing":
         if t in BREATHING_STOP_WORDS:
-            set_state(phone, tool="none", step=0, round_id=0)
+            # Stop immediately — round_id bump kills any running watcher
+            set_state(phone, tool="none", step=0, round_id=s["round_id"] + 1)
             send_message(phone, MSG_BREATHING_STOP)
         else:
-            new_round = s.get("round_id", 0) + 1
+            # Any other input = new round
+            new_round = s["round_id"] + 1
             set_state(phone, round_id=new_round)
             threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
-    # 4. Grounding — intercept ALL input
+    # 4. Grounding — catches ALL input before routing
     if tool == "grounding":
         if t in {"חזור", "איפוס", "די", "reset", "back", "stop"}:
             set_state(phone, tool="none", step=0)
@@ -280,23 +278,29 @@ def handle_message(phone, text):
         if next_step < len(GROUNDING_STEPS):
             send_message(phone, GROUNDING_STEPS[next_step])
             set_state(phone, step=next_step)
-            threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
+            threading.Thread(
+                target=nudge_if_silent_grounding,
+                args=(phone, next_step, 30),
+                daemon=True
+            ).start()
         else:
             set_state(phone, tool="none", step=0)
         return
 
-    # 5. Routing (tool == "none")
+    # 5. Routing
     if text == "א" or t == "a":
-        new_round = s.get("round_id", 0) + 1
+        new_round = s["round_id"] + 1
         set_state(phone, tool="breathing", step=0, round_id=new_round)
-        send_message(phone, BREATHING_START_MSG)
+        send_message(phone, BREATHING_START)
         threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
     if text == "ב" or t == "b":
         set_state(phone, tool="grounding", step=0)
         send_message(phone, GROUNDING_STEPS[0])
-        threading.Thread(target=nudge_if_silent, args=(phone, 30), daemon=True).start()
+        threading.Thread(
+            target=nudge_if_silent_grounding, args=(phone, 0, 30), daemon=True
+        ).start()
         return
 
     if text == "ג" or t == "c":
@@ -309,7 +313,7 @@ def handle_message(phone, text):
         send_message(phone, MSG_RETURNING)
         return
 
-    # 7. Anything else
+    # 7. Unknown
     send_message(phone, MSG_OFF_TOPIC)
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
