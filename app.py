@@ -1,4 +1,4 @@
-# v17 - Grounding rewrite: input validation, immediate step advance, 60s×2 nudge
+# v18 - Fix: grounding_session kills stale nudge threads; STATE_FILE saved next to app
 import os
 import time
 import json
@@ -13,7 +13,7 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
 WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 
-STATE_FILE  = "/tmp/user_states.json"
+STATE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_states.json")
 _state_lock = threading.Lock()
 
 # ── Persistent state ──────────────────────────────────────────────────────────
@@ -42,10 +42,11 @@ def get_state(phone):
             _all_states[phone] = {
                 "tool": "none", "step": 0,
                 "welcomed": False, "round_id": 0,
-                "last_msg_time": 0, "wait_count": 0
+                "last_msg_time": 0, "wait_count": 0,
+                "grounding_session": 0
             }
-        # Ensure wait_count exists in older saved states
         _all_states[phone].setdefault("wait_count", 0)
+        _all_states[phone].setdefault("grounding_session", 0)
         return dict(_all_states[phone])   # return a COPY to avoid race conditions
 
 def set_state(phone, **kwargs):
@@ -53,9 +54,11 @@ def set_state(phone, **kwargs):
         s = _all_states.setdefault(phone, {
             "tool": "none", "step": 0,
             "welcomed": False, "round_id": 0,
-            "last_msg_time": 0, "wait_count": 0
+            "last_msg_time": 0, "wait_count": 0,
+            "grounding_session": 0
         })
         s.setdefault("wait_count", 0)
+        s.setdefault("grounding_session", 0)
         s.update(kwargs)
         save_states(_all_states)
 
@@ -193,17 +196,17 @@ GROUNDING_HINTS = ["רואה", "יכול לגעת בהם", "שומע", "מריח
 
 # ── Grounding nudge (60s × 2) ─────────────────────────────────────────────────
 
-def nudge_if_silent_grounding(phone, my_step):
-    """60s → nudge 1. Another 60s → nudge 2. Stops if step changed."""
+def nudge_if_silent_grounding(phone, my_step, my_session):
+    """60s → nudge 1. Another 60s → nudge 2. Stops if step or session changed."""
     time.sleep(60)
     s = get_state(phone)
-    if s["tool"] != "grounding" or s["step"] != my_step:
+    if s["tool"] != "grounding" or s["step"] != my_step or s["grounding_session"] != my_session:
         return
     send_message(phone, GROUNDING_NUDGE_1)
 
     time.sleep(60)
     s = get_state(phone)
-    if s["tool"] != "grounding" or s["step"] != my_step:
+    if s["tool"] != "grounding" or s["step"] != my_step or s["grounding_session"] != my_session:
         return
     send_message(phone, GROUNDING_NUDGE_2)
 
@@ -308,9 +311,11 @@ def handle_message(phone, text):
 
     # 4. Grounding — catches ALL input before routing
     if tool == "grounding":
+        gs = s.get("grounding_session", 0)
         # Exit words
         if t in {"חזור", "איפוס", "reset", "back", "stop", "די"}:
-            set_state(phone, tool="none", step=0, wait_count=0)
+            set_state(phone, tool="none", step=0, wait_count=0,
+                      grounding_session=gs + 1)
             send_message(phone, MSG_RESET)
             return
         # Validate: reject conversation, guide back to task
@@ -319,17 +324,20 @@ def handle_message(phone, text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=hint))
             return
         # Valid answer → advance immediately to next step
-        set_state(phone, wait_count=0)
+        new_gs = gs + 1
         next_step = step + 1
         if next_step < len(GROUNDING_STEPS):
-            set_state(phone, step=next_step)
+            set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs)
             send_message(phone, GROUNDING_STEPS[next_step])
             threading.Thread(
-                target=nudge_if_silent_grounding, args=(phone, next_step), daemon=True
+                target=nudge_if_silent_grounding,
+                args=(phone, next_step, new_gs),
+                daemon=True
             ).start()
         else:
             # Step 5 answered → back to menu
-            set_state(phone, tool="none", step=0, wait_count=0)
+            set_state(phone, tool="none", step=0, wait_count=0,
+                      grounding_session=new_gs)
             send_message(phone, MSG_RETURNING)
         return
 
@@ -342,10 +350,11 @@ def handle_message(phone, text):
         return
 
     if text == "ב" or t == "b":
-        set_state(phone, tool="grounding", step=0, wait_count=0)
+        new_gs = s.get("grounding_session", 0) + 1
+        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs)
         send_message(phone, GROUNDING_STEPS[0])
         threading.Thread(
-            target=nudge_if_silent_grounding, args=(phone, 0), daemon=True
+            target=nudge_if_silent_grounding, args=(phone, 0, new_gs), daemon=True
         ).start()
         return
 
