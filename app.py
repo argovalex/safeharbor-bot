@@ -1,4 +1,4 @@
-# v16 - Fix: wait_count missing from default state caused grounding to crash and show off-topic
+# v17 - Grounding rewrite: input validation, immediate step advance, 60s×2 nudge
 import os
 import time
 import json
@@ -158,12 +158,54 @@ GROUNDING_STEPS = [
     "יופי. עכשיו, 3 דברים שאתה שומע סביבך.",
     "מעולה. עכשיו, 2 דברים שאתה יכול להריח.",
     "ודבר אחד שאתה יכול לטעום (או טעם שמרגיע אותך).",
-    "איך התחושה עכשיו? אני כאן איתך."
+    "איך התחושה עכשיו?"
+]
+
+# Required word count per step (minimum words the user must provide)
+GROUNDING_MIN_WORDS = [5, 4, 3, 2, 1, 1]
+
+# Phrases that look like conversation rather than grounding answers
+GROUNDING_CHAT_PHRASES = [
+    "מה זה", "למה", "אני לא", "אני לא יודע", "לא יודע",
+    "מה אתה", "מה את", "לא רוצה", "אני רוצה", "תגיד לי",
+    "why", "what", "how", "i don't", "i dont", "tell me",
+    "?", "help", "עזור", "הסבר",
 ]
 
 GROUNDING_NUDGE_1 = "אני כאן איתך. מצאת משהו אחד?"
-GROUNDING_NUDGE_2 = "אני כאן איתך. מצאת משהו אחד?"
-GROUNDING_NUDGE_3 = "נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן. כתוב 'המשך' או 'איפוס'."
+GROUNDING_NUDGE_2 = "נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן."
+
+def is_grounding_chat(text, step):
+    """Returns True if the input looks like conversation, not a grounding answer."""
+    t = text.lower().strip()
+    # Check for chat phrases
+    if any(phrase in t for phrase in GROUNDING_CHAT_PHRASES):
+        return True
+    # Check minimum word count for steps 0-4
+    if step < 5:
+        word_count = len(text.split())
+        if word_count < 1:
+            return True
+    return False
+
+GROUNDING_CHAT_REPLY = "אני כאן רק כדי לעזור לך להתייצב. נסה לציין דברים שאתה {hint} כרגע."
+GROUNDING_HINTS = ["רואה", "יכול לגעת בהם", "שומע", "מריח", "יכול לטעום", "מרגיש"]
+
+# ── Grounding nudge (60s × 2) ─────────────────────────────────────────────────
+
+def nudge_if_silent_grounding(phone, my_step):
+    """60s → nudge 1. Another 60s → nudge 2. Stops if step changed."""
+    time.sleep(60)
+    s = get_state(phone)
+    if s["tool"] != "grounding" or s["step"] != my_step:
+        return
+    send_message(phone, GROUNDING_NUDGE_1)
+
+    time.sleep(60)
+    s = get_state(phone)
+    if s["tool"] != "grounding" or s["step"] != my_step:
+        return
+    send_message(phone, GROUNDING_NUDGE_2)
 
 CRISIS_WORDS = [
     "suicide","kill myself","want to die","end my life","cut myself",
@@ -227,23 +269,6 @@ def run_breathing_round(phone):
         daemon=True
     ).start()
 
-# ── Grounding nudge (60s intervals, wait_count based) ────────────────────────
-
-def nudge_if_silent_grounding(phone, my_step):
-    """Sends nudges at 60s intervals if user hasn't responded. Uses wait_count."""
-    for count in range(1, 4):
-        time.sleep(60)
-        s = get_state(phone)
-        # Stop if tool changed or user advanced to next step
-        if s["tool"] != "grounding" or s["step"] != my_step:
-            return
-        wait_count = s.get("wait_count", 0) + 1
-        set_state(phone, wait_count=wait_count)
-        if wait_count <= 2:
-            send_message(phone, GROUNDING_NUDGE_1)
-        else:
-            send_message(phone, GROUNDING_NUDGE_3)
-            return  # No more nudges after wait_count >= 3
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
@@ -283,30 +308,27 @@ def handle_message(phone, text):
 
     # 4. Grounding — catches ALL input before routing
     if tool == "grounding":
-        reset_words = {"חזור", "איפוס", "reset", "back", "stop"}
-        # "המשך" = continue from where we are (re-send current step prompt)
-        if t == "המשך":
-            set_state(phone, wait_count=0)
-            send_message(phone, GROUNDING_STEPS[step])
-            threading.Thread(
-                target=nudge_if_silent_grounding, args=(phone, step), daemon=True
-            ).start()
-            return
-        if t in reset_words or t == "די":
+        # Exit words
+        if t in {"חזור", "איפוס", "reset", "back", "stop", "די"}:
             set_state(phone, tool="none", step=0, wait_count=0)
             send_message(phone, MSG_RESET)
             return
-        # Any other input = advance to next step
+        # Validate: reject conversation, guide back to task
+        if is_grounding_chat(text, step):
+            hint = GROUNDING_HINTS[step]
+            send_message(phone, GROUNDING_CHAT_REPLY.format(hint=hint))
+            return
+        # Valid answer → advance immediately to next step
         set_state(phone, wait_count=0)
         next_step = step + 1
         if next_step < len(GROUNDING_STEPS):
-            send_message(phone, GROUNDING_STEPS[next_step])
             set_state(phone, step=next_step)
+            send_message(phone, GROUNDING_STEPS[next_step])
             threading.Thread(
                 target=nudge_if_silent_grounding, args=(phone, next_step), daemon=True
             ).start()
         else:
-            # Step 5 completed → back to menu
+            # Step 5 answered → back to menu
             set_state(phone, tool="none", step=0, wait_count=0)
             send_message(phone, MSG_RETURNING)
         return
