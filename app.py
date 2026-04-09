@@ -1,4 +1,4 @@
-# v8 - Hebrew text direct, readable
+# v10 - Fix: new breathing round cancels previous post-round nudge/timeout threads
 import os
 import time
 import threading
@@ -20,7 +20,8 @@ def get_state(phone):
     if phone not in user_states:
         user_states[phone] = {
             "tool": "none", "step": 0, "wait_count": 0,
-            "welcomed": False, "last_msg_time": 0, "nudge_sent": False
+            "welcomed": False, "last_msg_time": 0, "nudge_sent": False,
+            "round_id": 0
         }
     return user_states[phone]
 
@@ -111,12 +112,7 @@ MSG_NUDGE = "אני כאן איתך, אתה עדיין איתי? בוא נמשי
 MSG_TIMEOUT = """אני עדיין כאן בשבילך. \U0001f499
 
 נראה שאתה צריך קצת זמן לעצמך - זה בסדר לגמרי.
-כשתרגיש מוכן, אני כאן.
-
-\U0001f32c\ufe0f א) נשימה מרגיעה
-\u2693 ב) תרגיל קרקוע
-
-\U0001f4de ע"ן: 1201 | \U0001f4ac https://wa.me/972528451201"""
+כשתרגיש מוכן, אני כאן. \u2693"""
 
 MSG_CRISIS = """אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך.
 
@@ -135,6 +131,10 @@ MSG_OFF_TOPIC = """אני כאן רק כדי לעזור לך להתרגע ולה
 MSG_STOP = "עוצרים כאן. אני כאן כשתצטרך. \U0001f64f"
 MSG_RESET = "בסדר, אני כאן כשתצטרך. \U0001f30a"
 MSG_END = "תודה שהיית איתנו. אני כאן תמיד כשתצטרך. \u26f5"
+
+# ── Updated breathing: new opening + post-round nudge/timeout ────────────────
+
+BREATHING_START_MSG = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 BREATHING_PARTS = [
     "\U0001f32c\ufe0f שאיפה איטית... 21-22-23-24-25",
@@ -186,9 +186,48 @@ def is_crisis(text):
 def is_off_topic(text):
     return any(w.lower() in text.lower() for w in OFF_TOPIC_WORDS)
 
+def breathing_post_round_wait(phone, my_round_id):
+    """
+    After the breathing round ends:
+    - Wait 30 seconds; if no response AND round_id unchanged, send MSG_NUDGE
+    - Wait another 60 seconds; if still no response AND round_id unchanged, send MSG_TIMEOUT and reset
+    If the user starts a new round (round_id changes), this thread exits silently.
+    """
+    time.sleep(30)
+    state = get_state(phone)
+    # Abort if tool changed or a new round started
+    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+        return
+
+    state["nudge_sent"] = True
+    send_message(phone, MSG_NUDGE)
+
+    time.sleep(60)
+    state = get_state(phone)
+    # Abort if tool changed or a new round started
+    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+        return
+
+    set_state(phone, tool="none", step=0, wait_count=0)
+    send_message(phone, MSG_TIMEOUT)
+
 def run_breathing_round(phone):
+    """Send all breathing parts with delay, then start post-round wait logic."""
+    # Capture the round_id at the start of this round
+    state = get_state(phone)
+    my_round_id = state["round_id"]
+
     send_messages_with_delay(phone, BREATHING_PARTS, 5)
-    nudge_if_silent(phone, 30)
+
+    # After round completes, verify we're still in the same round
+    state = get_state(phone)
+    if state["tool"] != "breathing" or state["round_id"] != my_round_id:
+        return  # A new round or tool change happened during send; don't start watcher
+
+    state["last_msg_time"] = time.time()
+    state["nudge_sent"] = False
+    # Start the post-round nudge/timeout watcher, passing round_id
+    threading.Thread(target=breathing_post_round_wait, args=(phone, my_round_id), daemon=True).start()
 
 def handle_message(phone, text):
     text = text.strip()
@@ -212,12 +251,12 @@ def handle_message(phone, text):
     # 3. Breathing
     if tool == "breathing":
         stop_words = ["לא", "די", "no", "stop", "done"]
-        yes_words = ["כן", "כ", "yes", "y", "ok", "אוק"]
         if any(w == text.lower() for w in stop_words):
             set_state(phone, tool="none", step=0)
             send_message(phone, MSG_STOP)
             return
-        # כן או כל תשובה אחרת = סבב נוסף
+        # כן או כל תשובה אחרת = סבב נוסף — increment round_id to cancel previous watcher
+        state["round_id"] = state.get("round_id", 0) + 1
         threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
@@ -239,8 +278,8 @@ def handle_message(phone, text):
 
     # 5. Routing
     if text == "א" or text.lower() == "a":
-        set_state(phone, tool="breathing", step=0)
-        send_message(phone, "אני כאן איתך, נתחיל יחד עכשיו. \U0001f32c\ufe0f")
+        set_state(phone, tool="breathing", step=0, round_id=state.get("round_id", 0) + 1)
+        send_message(phone, BREATHING_START_MSG)
         threading.Thread(target=run_breathing_round, args=(phone,), daemon=True).start()
         return
 
