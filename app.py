@@ -1,4 +1,4 @@
-# v23 - Admin dashboard: visual blacklist management at /admin?key=YOUR_KEY
+# v24 - Fix: injection regex patterns updated (pretend you are, show me your system prompt)
 import os
 import time
 import json
@@ -34,7 +34,7 @@ INJECTION_PATTERNS = [
     # Prompt injection attempts
     r"ignore (previous|all|above)",
     r"forget (everything|all|your instructions)",
-    r"(act|behave|pretend|roleplay) as",
+    r"(act|behave|pretend|roleplay) (as|like|you are)",
     r"you are now",
     r"new (instructions|prompt|system)",
     r"developer mode",
@@ -44,7 +44,7 @@ INJECTION_PATTERNS = [
     r"הוראות חדשות",
     r"אתה עכשיו",
     # Attempts to extract system info
-    r"(show|print|reveal|tell me) (your|the) (prompt|instructions|system)",
+    r"(show|print|reveal|give me|tell me).{0,20}(prompt|instructions|system)",
     r"מה ה(פרומפט|הוראות|מערכת)",
     # Script/code injection
     r"<script",
