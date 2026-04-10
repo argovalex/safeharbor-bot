@@ -1,4 +1,4 @@
-# v27 - UX: clearer א/ב instructions, better off_topic, nudge after welcome
+# v28 - Fix: NameError in _register_allowed_messages (MSG_WELCOME_NUDGE defined after call)
 import os
 import time
 import json
@@ -69,7 +69,7 @@ def _register_allowed_messages():
     from_lists = [
         [MSG_WELCOME, MSG_RETURNING, MSG_NUDGE, MSG_CRISIS,
          MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET, BREATHING_START,
-         GROUNDING_NUDGE_1, GROUNDING_NUDGE_2, MSG_WELCOME_NUDGE],
+         GROUNDING_NUDGE_1, GROUNDING_NUDGE_2],
         BREATHING_PARTS,
         GROUNDING_STEPS,
     ]
@@ -78,6 +78,8 @@ def _register_allowed_messages():
             _ALLOWED_OUTGOING.add(msg.strip())
     # Dynamic messages with format placeholders
     _ALLOWED_OUTGOING.add("__GROUNDING_CHAT_REPLY__")   # validated separately
+    # Added after messages are defined
+    _ALLOWED_OUTGOING.add("אני כאן איתך. \u2693\nכתוב *א* לנשימה או *ב* לקרקוע.")
 
 def is_allowed_outgoing(text):
     """Returns True if the message is a known valid bot response."""
