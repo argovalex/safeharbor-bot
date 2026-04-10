@@ -1,4 +1,4 @@
-# v30 - Fix: breathing stop message updated, airtight breathing handler
+# v31 - Fix: per-phone lock prevents concurrent grounding step duplication
 import os
 import time
 import json
@@ -424,7 +424,14 @@ def nudge_after_welcome(phone, welcomed_time):
 # ── MAIN HANDLER ──────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+_phone_locks = defaultdict(threading.Lock)
+
 def handle_message(phone, text):
+    # Per-phone lock — prevents two messages from the same user running concurrently
+    with _phone_locks[phone]:
+        _handle_message_inner(phone, text)
+
+def _handle_message_inner(phone, text):
     text = text.strip()
     t    = text.lower()
 
