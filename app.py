@@ -1,4 +1,4 @@
-# v29 - Fix: lazy registration of allowed messages prevents NameError at import
+# v30 - Fix: breathing stop message updated, airtight breathing handler
 import os
 import time
 import json
@@ -70,7 +70,11 @@ MSG_OFF_TOPIC = (
     'כתוב *א* לתרגיל נשימה \U0001f32c\ufe0f\n'
     'כתוב *ב* לתרגיל קרקוע \u2693'
 )
-MSG_BREATHING_STOP = "אני כאן אם תצטרך אותי שוב. שמור על עצמך. \U0001f499"
+MSG_BREATHING_STOP = (
+    "יופי שעצרת רגע להקשיב לעצמך \U0001f33f\n"
+    "אפשר להישאר עם התחושה הזו עוד כמה שניות, בקצב שנוח לך \U0001f54a\ufe0f\n\n"
+    "אם תרצה לחזור לזה בהמשך, אני כאן \u2693"
+)
 MSG_RESET          = "בסדר, אני כאן כשתצטרך. \U0001f30a"
 BREATHING_START    = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
@@ -456,16 +460,17 @@ def handle_message(phone, text):
         _executor.submit(nudge_after_welcome, phone, now)
         return
 
-    # 3. Breathing
+    # 3. Breathing — ALL input intercepted here, no fallthrough possible
     if tool == "breathing":
         if t in BREATHING_STOP_WORDS:
             set_state(phone, tool="none", step=0, round_id=s["round_id"] + 1, force_save=True)
             send_message(phone, MSG_BREATHING_STOP)
         else:
+            # ANY other input = new round (including nudge replies, emojis, anything)
             new_round = s["round_id"] + 1
             set_state(phone, round_id=new_round, force_save=True)
             _executor.submit(run_breathing_round, phone)
-        return
+        return   # ← ALWAYS return, never fall through
 
     # 4. Grounding
     if tool == "grounding":
