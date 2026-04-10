@@ -1,4 +1,4 @@
-# v26 - Logo sent on first welcome, ⚓ replaces 🏠 in welcome message
+# v27 - UX: clearer א/ב instructions, better off_topic, nudge after welcome
 import os
 import time
 import json
@@ -69,7 +69,7 @@ def _register_allowed_messages():
     from_lists = [
         [MSG_WELCOME, MSG_RETURNING, MSG_NUDGE, MSG_CRISIS,
          MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET, BREATHING_START,
-         GROUNDING_NUDGE_1, GROUNDING_NUDGE_2],
+         GROUNDING_NUDGE_1, GROUNDING_NUDGE_2, MSG_WELCOME_NUDGE],
         BREATHING_PARTS,
         GROUNDING_STEPS,
     ]
@@ -306,15 +306,15 @@ MSG_WELCOME = (
     '\U0001f4ac סה"ר: https://wa.me/972543225656\n'
     '☎️ נט"ל: 1-800-363-363\n\n'
     '*מה יעזור לך יותר ברגע הזה?*\n'
-    '\U0001f32c\ufe0f א) תרגילי נשימה\n'
-    '\u2693 ב) תרגיל קרקוע'
+    '\U0001f32c\ufe0f כתוב *א* — תרגילי נשימה\n'
+    '\u2693 כתוב *ב* — תרגיל קרקוע'
 )
 MSG_RETURNING = (
     'היי, טוב שחזרת אלי. \U0001f499\n'
     'אני נמל הבית, ואני כאן איתך שוב.\n\n'
     '*מה מרגיש לך נכון יותר ברגע הזה?*\n'
-    '\U0001f32c\ufe0f א) נשימה מרגיעה\n'
-    '\u2693 ב) תרגיל קרקוע\n\n'
+    '\U0001f32c\ufe0f כתוב *א* — נשימה מרגיעה\n'
+    '\u2693 כתוב *ב* — תרגיל קרקוע\n\n'
     'זכור שיש עזרה אנושית זמינה עבורך תמיד:\n'
     '☎️ ער"ן: 1201 | \U0001f4ac https://wa.me/972528451201\n'
     '\U0001f4ac סה"ר: https://wa.me/972543225656\n'
@@ -333,11 +333,11 @@ MSG_CRISIS = (
     '☎️ נט"ל: 1-800-363-363'
 )
 MSG_OFF_TOPIC = (
-    'אני כאן רק כדי לעזור לך להתרגע ולהתייצב. בוא נתמקד במה שמרגיש ברגע זה:\n\n'
-    '\U0001f32c\ufe0f א) תרגילי נשימה\n'
-    '\u2693 ב) תרגיל קרקוע'
+    'אני כאן כדי לעזור לך להתייצב. \u2693\n\n'
+    'כתוב *א* לתרגיל נשימה \U0001f32c\ufe0f\n'
+    'כתוב *ב* לתרגיל קרקוע \u2693'
 )
-MSG_BREATHING_STOP = "אני כאן אם תצטרך אותי שוב. שמור על עצמך. \U0001f499"
+MSG_WELCOME_NUDGE = "אני כאן איתך. \u2693\nכתוב *א* לנשימה או *ב* לקרקוע."
 MSG_RESET          = "בסדר, אני כאן כשתצטרך. \U0001f30a"
 BREATHING_START    = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
@@ -404,7 +404,15 @@ def is_grounding_chat(text, step):
 # ── BREATHING ─────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-def breathing_post_round_wait(phone, my_round_id):
+def nudge_after_welcome(phone, welcomed_time):
+    """60s after welcome → send nudge if user hasn't responded yet."""
+    time.sleep(60)
+    s = get_state(phone)
+    # Only nudge if user still hasn't picked a tool
+    if s["tool"] == "none" and s["welcomed"] and s["last_msg_time"] <= welcomed_time + 1:
+        send_message(phone, MSG_WELCOME_NUDGE)
+
+
     time.sleep(30)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
@@ -489,6 +497,7 @@ def handle_message(phone, text):
         set_state(phone, welcomed=True, force_save=True)
         send_logo(phone)
         send_message(phone, MSG_WELCOME)
+        _executor.submit(nudge_after_welcome, phone, now)
         return
 
     # Breathing
