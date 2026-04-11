@@ -1,4 +1,4 @@
-# v31 - Fix: per-phone lock prevents concurrent grounding step duplication
+# v32 - Fix: breathing thread race condition - check state AFTER sleep, BEFORE each send
 import os
 import time
 import json
@@ -286,7 +286,7 @@ def send_logo(to):
         print("[send_logo error] {}".format(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── PERSISTENT STATE ──────────────────────────────────────────────────────────
+# ── PERSISTENT STATE ──────────────────────────────────────────════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _default_state():
@@ -382,12 +382,19 @@ def run_breathing_round(phone):
     s = get_state(phone)
     my_round_id = s["round_id"]
     for i, part in enumerate(BREATHING_PARTS):
+        # ── FIX v32: check state BEFORE every send ──────────────────────────
         s = get_state(phone)
         if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-            return
+            return  # user stopped or switched tool — abort immediately
+        # ────────────────────────────────────────────────────────────────────
         send_message(phone, part)
         if i < len(BREATHING_PARTS) - 1:
             time.sleep(5)
+            # ── FIX v32: check state AFTER sleep too, before next iteration ─
+            s = get_state(phone)
+            if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+                return  # stopped during the sleep — abort immediately
+            # ────────────────────────────────────────────────────────────────
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
@@ -640,7 +647,7 @@ def receive_message():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "SafeHarbor Bot is running v29", 200
+    return "SafeHarbor Bot is running v32", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
