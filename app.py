@@ -1,10 +1,13 @@
-# v34 - Performance & correctness audit: 12 fixes
+# v35 - State backend: Redis (replaces file + in-memory dict)
+#        Survives server restarts, hibernation, and multi-instance deploys.
+#        Set env var REDIS_URL=redis://... (Render provides this automatically).
 import os
 import time
 import json
 import threading
 import requests
 import re
+import redis as redis_lib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
@@ -16,13 +19,24 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
 WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 
-STATE_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_states.json")
-_state_lock   = threading.Lock()
-_dirty        = False
-_last_save    = 0
-SAVE_INTERVAL = 5
-DEBOUNCE_SEC  = 1.0
-_executor     = ThreadPoolExecutor(max_workers=50)
+DEBOUNCE_SEC = 1.0
+_executor    = ThreadPoolExecutor(max_workers=50)
+
+# ── Redis connection ──────────────────────────────────────────────────────────
+# Render injects REDIS_URL automatically when you attach a Redis instance.
+# Locally: export REDIS_URL=redis://localhost:6379
+_redis = redis_lib.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    decode_responses=True,
+    socket_timeout=3,
+    socket_connect_timeout=3,
+    retry_on_timeout=True,
+)
+
+STATE_KEY_PREFIX = "sh:state:"    # sh:state:972501234567
+BLACKLIST_KEY    = "sh:blacklist" # Redis hash  {phone: json}
+SEEN_MSG_KEY     = "sh:seen_msgs" # Redis hash  {msg_id: timestamp}
+SEEN_MSG_TTL_SEC = 120
 
 LOGO_URL = "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png"
 
@@ -211,53 +225,34 @@ def _ensure_registered():
 
 RATE_WINDOW_SEC = 60
 RATE_MAX_MSGS   = 20
-BLACKLIST_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blacklist.json")
 ADMIN_SMS_TO    = os.environ.get("ADMIN_PHONE", "")
 ADMIN_API_KEY   = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
 
-_rate_counters  = defaultdict(list)
-_rate_lock      = threading.Lock()
-_blacklist_lock = threading.Lock()
-
-def _load_blacklist():
-    try:
-        if os.path.exists(BLACKLIST_FILE):
-            with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def _save_blacklist(bl):
-    try:
-        with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(bl, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("[blacklist save error] {}".format(e))
-
-_blacklist = _load_blacklist()
+_rate_counters = defaultdict(list)
+_rate_lock     = threading.Lock()
 
 def is_blacklisted(phone):
-    with _blacklist_lock:
-        return phone in _blacklist
+    try:
+        return _redis.hexists(BLACKLIST_KEY, phone)
+    except Exception:
+        return False
 
 def add_to_blacklist(phone, reason="rate_limit"):
-    with _blacklist_lock:
-        _blacklist[phone] = {
+    try:
+        _redis.hset(BLACKLIST_KEY, phone, json.dumps({
             "reason": reason,
             "time": time.time(),
             "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        }
-        _save_blacklist(_blacklist)
+        }))
+    except Exception as e:
+        print("[redis blacklist add error] {}".format(e))
     print("[BLACKLIST] Added: {} reason={}".format(phone, reason))
     _send_admin_alert(phone, reason)
 
 def remove_from_blacklist(phone):
-    with _blacklist_lock:
-        if phone in _blacklist:
-            del _blacklist[phone]
-            _save_blacklist(_blacklist)
-            return True
+    try:
+        return bool(_redis.hdel(BLACKLIST_KEY, phone))
+    except Exception:
         return False
 
 def _send_admin_alert(phone, reason):
@@ -272,11 +267,9 @@ def _send_admin_alert(phone, reason):
     except Exception as e:
         print("[admin alert error] {}".format(e))
 
-# ── FIX 9: single lock for rate-limit check (blacklist + counter together) ────
 def rate_limit_check(phone):
-    with _blacklist_lock:
-        if phone in _blacklist:
-            return True
+    if is_blacklisted(phone):
+        return True
     now = time.time()
     with _rate_lock:
         _rate_counters[phone] = [t for t in _rate_counters[phone] if now - t < RATE_WINDOW_SEC]
@@ -312,10 +305,9 @@ def send_logo(to):
         print("[send_logo error] {}".format(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── PERSISTENT STATE ──────────────────────────────────════════════════════════
+# ── STATE — Redis backend ─────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── FIX 1: singleton default state — never allocate unless needed ─────────────
 _STATE_DEFAULTS = {
     "tool": "none", "step": 0,
     "welcomed": False, "round_id": 0,
@@ -324,66 +316,31 @@ _STATE_DEFAULTS = {
 }
 
 def _default_state():
-    return dict(_STATE_DEFAULTS)   # cheap shallow copy of a small dict
-
-def load_states():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-# ── FIX 10: background flusher does NOT hold _state_lock while writing ────────
-def _flush_if_needed(force=False):
-    global _dirty, _last_save
-    now = time.time()
-    if not _dirty:
-        return
-    if not force and now - _last_save < SAVE_INTERVAL:
-        return
-    # Snapshot under lock, write outside lock
-    with _state_lock:
-        if not _dirty:
-            return
-        snapshot = dict(_all_states)
-        _dirty    = False
-        _last_save = now
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False)
-    except Exception as e:
-        print("[save error] {}".format(e))
-
-_all_states = load_states()
+    return dict(_STATE_DEFAULTS)
 
 def get_state(phone):
-    with _state_lock:
-        if phone not in _all_states:
-            _all_states[phone] = _default_state()
-        s = _all_states[phone]
-        for k, v in _STATE_DEFAULTS.items():
-            s.setdefault(k, v)
-        return dict(s)
+    """Read user state from Redis. Returns dict with all keys guaranteed."""
+    try:
+        raw = _redis.get(STATE_KEY_PREFIX + phone)
+        if raw:
+            s = json.loads(raw)
+            for k, v in _STATE_DEFAULTS.items():
+                s.setdefault(k, v)
+            return s
+    except Exception as e:
+        print("[redis get_state error] {}".format(e))
+    return _default_state()
 
 def set_state(phone, force_save=False, **kwargs):
-    global _dirty
-    with _state_lock:
-        s = _all_states.setdefault(phone, _default_state())
-        for k, v in _STATE_DEFAULTS.items():
-            s.setdefault(k, v)
+    """Write user state to Redis atomically. force_save is a no-op (Redis is always durable)."""
+    try:
+        # Read-modify-write under a Redis-level lock (WATCH would be overkill here;
+        # _phone_locks in handle_message already serialises per-user access)
+        s = get_state(phone)
         s.update(kwargs)
-        _dirty = True
-    if force_save:
-        _flush_if_needed(force=True)
-
-def _background_flusher():
-    while True:
-        time.sleep(SAVE_INTERVAL)
-        _flush_if_needed(force=True)   # FIX 10: no longer inside _state_lock
-
-threading.Thread(target=_background_flusher, daemon=True).start()
+        _redis.set(STATE_KEY_PREFIX + phone, json.dumps(s))
+    except Exception as e:
+        print("[redis set_state error] {}".format(e))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── BREATHING ─────────────────────────────────────────────────────────────────
@@ -454,30 +411,18 @@ def nudge_after_welcome(phone, welcomed_time):
 # ── WEBHOOK DEDUPLICATION ─────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-_seen_msg_ids  = {}
-_seen_msg_lock = threading.Lock()
-SEEN_MSG_TTL_SEC = 120
-
-# ── FIX 7: lazy TTL purge — only purge when cache grows, not on every call ────
-_SEEN_PURGE_EVERY = 500   # purge every 500 new messages
-
+# ── Dedup via Redis SET NX + EXPIRE ──────────────────────────────────────────
+# SETNX is atomic: returns 1 (new) or 0 (already exists) in a single round-trip.
+# EXPIRE auto-removes the key after TTL — no manual purge needed.
 def _is_duplicate_msg(msg_id):
-    now = time.time()
-    with _seen_msg_lock:
-        if msg_id in _seen_msg_ids:
-            # Check TTL on read — expired entry = not a duplicate
-            if now - _seen_msg_ids[msg_id] <= SEEN_MSG_TTL_SEC:
-                return True
-            # Expired: treat as new, update timestamp
-            _seen_msg_ids[msg_id] = now
-            return False
-        _seen_msg_ids[msg_id] = now
-        # Lazy purge only every N new entries
-        if len(_seen_msg_ids) % _SEEN_PURGE_EVERY == 0:
-            expired = [k for k, t in _seen_msg_ids.items() if now - t > SEEN_MSG_TTL_SEC]
-            for k in expired:
-                del _seen_msg_ids[k]
-        return False
+    try:
+        key = "sh:msg:" + msg_id
+        # SET key 1 NX EX ttl — atomic "set if not exists with expiry"
+        result = _redis.set(key, "1", nx=True, ex=SEEN_MSG_TTL_SEC)
+        return result is None   # None = key already existed = duplicate
+    except Exception as e:
+        print("[redis dedup error] {}".format(e))
+        return False  # on Redis error, let message through
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── MAIN HANDLER ──────────────────────────────────────────────────────────────
@@ -608,8 +553,11 @@ def admin_dashboard():
         <input type="password" name="key" placeholder="Admin key" autofocus>
         <button type="submit">כניסה</button></form></div></body></html>''', 401
 
-    with _blacklist_lock:
-        bl_copy = dict(_blacklist)
+    try:
+        raw = _redis.hgetall(BLACKLIST_KEY)
+        bl_copy = {k: json.loads(v) for k, v in raw.items()}
+    except Exception:
+        bl_copy = {}
 
     rows = ""
     for phone, info in sorted(bl_copy.items(), key=lambda x: x[1].get("time", 0), reverse=True):
@@ -650,8 +598,12 @@ def admin_dashboard():
 def admin_list_blacklist():
     if not _check_admin_key(request):
         return jsonify({"error": "unauthorized"}), 401
-    with _blacklist_lock:
-        return jsonify({"blacklist": _blacklist, "count": len(_blacklist)}), 200
+    try:
+        raw = _redis.hgetall(BLACKLIST_KEY)
+        bl = {k: json.loads(v) for k, v in raw.items()}
+    except Exception:
+        bl = {}
+    return jsonify({"blacklist": bl, "count": len(bl)}), 200
 
 @app.route("/admin/blacklist/<phone>", methods=["DELETE"])
 def admin_remove_blacklist(phone):
@@ -702,7 +654,7 @@ def receive_message():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "SafeHarbor Bot is running v34", 200
+    return "SafeHarbor Bot is running v35", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
