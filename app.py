@@ -1,55 +1,119 @@
-# v35 - State backend: Redis (replaces file + in-memory dict)
-#        Survives server restarts, hibernation, and multi-instance deploys.
-#        Set env var REDIS_URL=redis://... (Render provides this automatically).
-import os
-import time
-import json
-import threading
-import requests
+# SafeHarbor Bot v37 - Production Ready
+# Changes from v36:
+# 1. RQ background queue - breathing/grounding/nudge dont block threads
+# 2. Rate limiting via Redis sliding window - works across multiple workers
+# 3. Retry with exponential backoff on send_message (Meta 429)
+# 4. Redis socket_timeout=10s + health_check_interval
+# 5. Structured JSON logging - all print replaced with logger
+# 6. Admin: X-Admin-Key header only (not query string) + rate limit
+# 7. Blacklist entries with 30-day TTL
+# 8. Sentry optional error tracking
+# 9. /health endpoint checks Redis + returns version/uptime
+#
+# Railway services:
+#   web    -> gunicorn app:app --workers 2 --threads 4 --timeout 30
+#   worker -> rq worker --url $REDIS_URL safeharbor
+#
+# requirements.txt:
+#   flask>=3.0
+#   requests>=2.32
+#   redis>=5.0
+#   rq>=1.16
+#   gunicorn>=22.0
+#   sentry-sdk>=2.0
+
+import os, time, json, logging, threading
+import requests as http_requests
 import re
 import redis as redis_lib
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 
-app = Flask(__name__)
+# Structured JSON logging
+class _JsonFmt(logging.Formatter):
+    def format(self, r):
+        d = {"ts": self.formatTime(r, "%Y-%m-%dT%H:%M:%S"), "level": r.levelname, "msg": r.getMessage()}
+        if r.exc_info: d["exc"] = self.formatException(r.exc_info)
+        return json.dumps(d, ensure_ascii=False)
+
+_h = logging.StreamHandler()
+_h.setFormatter(_JsonFmt())
+logging.basicConfig(handlers=[_h], level=logging.INFO, force=True)
+log = logging.getLogger("safeharbor")
+
+# Sentry optional
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(dsn=_SENTRY_DSN, traces_sample_rate=0.1)
+        log.info("sentry_initialized")
+    except ImportError:
+        log.warning("sentry_sdk_not_installed")
+
+app         = Flask(__name__)
+_START_TIME = time.time()
 
 WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
 WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
+DEBOUNCE_SEC      = 1.0
+LOGO_URL          = "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png"
 
-DEBOUNCE_SEC = 1.0
-_executor    = ThreadPoolExecutor(max_workers=50)
+_WA_HEADERS = {
+    "Authorization": "Bearer {}".format(WHATSAPP_TOKEN),
+    "Content-Type":  "application/json",
+}
 
-# ── Redis connection ──────────────────────────────────────────────────────────
-# Render injects REDIS_URL automatically when you attach a Redis instance.
-# Locally: export REDIS_URL=redis://localhost:6379
+# Redis - FIX 4: socket_timeout=10, health_check_interval=30
 _redis = redis_lib.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True,
-    socket_timeout=3,
-    socket_connect_timeout=3,
+    socket_timeout=10,
+    socket_connect_timeout=10,
     retry_on_timeout=True,
+    health_check_interval=30,
 )
 
-STATE_KEY_PREFIX = "sh:state:"    # sh:state:972501234567
-BLACKLIST_KEY    = "sh:blacklist" # Redis hash  {phone: json}
-SEEN_MSG_KEY     = "sh:seen_msgs" # Redis hash  {msg_id: timestamp}
-SEEN_MSG_TTL_SEC = 120
+# RQ background queue - FIX 1
+try:
+    from rq import Queue as _RQ_Queue
+    _rq     = _RQ_Queue("safeharbor", connection=_redis)
+    _USE_RQ = True
+    log.info("rq_initialized")
+except ImportError:
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _executor = _TPE(max_workers=20)
+    _USE_RQ   = False
+    log.warning("rq_not_installed_fallback_threadpool")
 
-LOGO_URL = "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png"
+def _enqueue(fn, *args):
+    if _USE_RQ:
+        _rq.enqueue(fn, *args, job_timeout=300)
+    else:
+        _executor.submit(fn, *args)
 
-# ── FIX 8: pre-build headers once, reuse on every request ────────────────────
-_WA_HEADERS = {
-    "Authorization": "Bearer {}".format(WHATSAPP_TOKEN),
-    "Content-Type": "application/json",
-}
+# Admin rate limit
+ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
+ADMIN_SMS_TO       = os.environ.get("ADMIN_PHONE", "")
+_ADMIN_MAX_PER_MIN = 10
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── MESSAGES ──────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+def _admin_rate_ok(ip):
+    now = time.time()
+    key = "sh:admin_rate:{}".format(ip)
+    try:
+        pipe = _redis.pipeline()
+        pipe.zremrangebyscore(key, 0, now - 60)
+        pipe.zadd(key, {str(now): now})
+        pipe.zcard(key)
+        pipe.expire(key, 60)
+        _, _, count, _ = pipe.execute()
+        return count <= _ADMIN_MAX_PER_MIN
+    except Exception:
+        return True
 
+# Messages
 MSG_WELCOME = (
     '*שלום, אני נמל הבית* \u2693\n'
     'אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.\n\n'
@@ -72,10 +136,7 @@ MSG_RETURNING = (
     '\U0001f4ac סה"ר: https://wa.me/972543225656\n'
     '\u260e\ufe0f נט"ל: 1-800-363-363'
 )
-MSG_NUDGE = (
-    "אני כאן איתך, אתה עדיין איתי? "
-    "בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. \u2693"
-)
+MSG_NUDGE         = "אני כאן איתך, אתה עדיין איתי? בוא נמשיך יחד בתרגיל, זה עוזר להחזיר את השליטה. \u2693"
 MSG_WELCOME_NUDGE = "אני כאן איתך. \u2693\nכתוב *א* לנשימה או *ב* לקרקוע."
 MSG_CRISIS = (
     'אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך. \U0001f499\n\n'
@@ -126,12 +187,11 @@ GROUNDING_NUDGE_2    = "\u23f3 נראה שאתה צריך יותר זמן. אנ�
 GROUNDING_CHAT_REPLY = "אני כאן רק כדי לעזור לך להתייצב. נסה לציין דברים שאתה {hint} כרגע."
 GROUNDING_HINTS      = ["רואה", "יכול לגעת בהם", "שומע", "מריח", "יכול לטעום", "מרגיש"]
 
-BREATHING_STOP_WORDS = {"לא", "ל", "no", "n", "די", "stop", "done"}
-GREET_WORDS          = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
+BREATHING_STOP_WORDS  = {"לא", "ל", "no", "n", "די", "stop", "done"}
+GREET_WORDS           = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
 GROUNDING_RESET_WORDS = {"חזור", "איפוס", "reset", "back", "stop", "די"}
 
-# ── FIX 3: crisis detection via compiled regex (O(1) vs O(n) list scan) ──────
-_CRISIS_WORDS_LIST = [
+_CRISIS_WORDS = [
     "suicide", "kill myself", "want to die", "end my life", "cut myself",
     "no reason to live", "no hope", "worthless",
     "להתאבד", "למות", "לסיים הכל", "להיעלם", "רוצה למות", "בא לי למות",
@@ -141,37 +201,26 @@ _CRISIS_WORDS_LIST = [
     "חושך מוחלט", "לישון ולא לקום",
     "אין לי תקווה", "לא רוצה לחיות", "נמאס לי לחיות", "לא שווה לחיות",
 ]
-_crisis_re = re.compile(
-    "|".join(re.escape(w) for w in _CRISIS_WORDS_LIST),
-    re.IGNORECASE
-)
+_crisis_re = re.compile("|".join(re.escape(w) for w in _CRISIS_WORDS), re.IGNORECASE)
 
 def is_crisis(text):
     return bool(_crisis_re.search(text))
 
-# ── FIX 4+12: grounding chat detection via compiled regex, remove dead code ───
 _GROUNDING_CHAT_PHRASES = [
     "מה זה", "למה", "אני לא", "אני לא יודע", "לא יודע",
     "מה אתה", "מה את", "לא רוצה", "אני רוצה", "תגיד לי",
     "why", "what", "how", "i don't", "i dont", "tell me",
     "help", "עזור", "הסבר",
-    # NOTE: "?" removed — it matched ANY question, preventing grounding step
-    # from advancing when user wrote e.g. "חלון? שולחן?"
 ]
 _grounding_chat_re = re.compile(
-    "|".join(re.escape(p) for p in _GROUNDING_CHAT_PHRASES),
-    re.IGNORECASE
+    "|".join(re.escape(p) for p in _GROUNDING_CHAT_PHRASES), re.IGNORECASE
 )
 
-def is_grounding_chat(text, step):
-    # FIX 12: removed `len(text.split()) < 1` — always False, dead code
+def is_grounding_chat(text):
     return bool(_grounding_chat_re.search(text.lower()))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── GUARDIAN ──────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-INJECTION_PATTERNS = [
+# Guardian
+_INJECTION_PATTERNS = [
     r"ignore (previous|all|above)",
     r"forget (everything|all|your instructions)",
     r"(act|behave|pretend|roleplay) (as|like|you are)",
@@ -191,12 +240,11 @@ INJECTION_PATTERNS = [
     r"eval\(",
     r"exec\(",
 ]
-_injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
+_injection_re = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
 
 def guardian_check_input(text):
     return bool(_injection_re.search(text))
 
-# ── FIX 5: build allowed-outgoing set at module load, no runtime bool check ───
 _ALLOWED_OUTGOING = set()
 
 def _build_allowed_outgoing():
@@ -207,7 +255,7 @@ def _build_allowed_outgoing():
     for msg in BREATHING_PARTS + GROUNDING_STEPS:
         _ALLOWED_OUTGOING.add(msg.strip())
 
-_build_allowed_outgoing()   # called once at import, never again
+_build_allowed_outgoing()
 
 def is_allowed_outgoing(text):
     t = text.strip()
@@ -217,19 +265,14 @@ def is_allowed_outgoing(text):
         return True
     return False
 
-# needed for test compatibility
 def _ensure_registered():
-    pass  # no-op — set already built at module load
+    pass
 
-# ── Rate limiting + permanent blacklist ───────────────────────────────────────
-
+# Rate limiting - FIX 2: Redis sliding window
 RATE_WINDOW_SEC = 60
 RATE_MAX_MSGS   = 20
-ADMIN_SMS_TO    = os.environ.get("ADMIN_PHONE", "")
-ADMIN_API_KEY   = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
-
-_rate_counters = defaultdict(list)
-_rate_lock     = threading.Lock()
+BLACKLIST_KEY   = "sh:blacklist"
+BLACKLIST_TTL   = 30 * 24 * 3600  # FIX 7: 30-day TTL
 
 def is_blacklisted(phone):
     try:
@@ -240,13 +283,14 @@ def is_blacklisted(phone):
 def add_to_blacklist(phone, reason="rate_limit"):
     try:
         _redis.hset(BLACKLIST_KEY, phone, json.dumps({
-            "reason": reason,
-            "time": time.time(),
-            "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            "reason":   reason,
+            "time":     time.time(),
+            "time_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "expires":  time.time() + BLACKLIST_TTL,
         }))
     except Exception as e:
-        print("[redis blacklist add error] {}".format(e))
-    print("[BLACKLIST] Added: {} reason={}".format(phone, reason))
+        log.error("blacklist_add_error", extra={"err": str(e)})
+    log.warning("phone_blacklisted", extra={"phone": phone, "reason": reason})
     _send_admin_alert(phone, reason)
 
 def remove_from_blacklist(phone):
@@ -255,71 +299,98 @@ def remove_from_blacklist(phone):
     except Exception:
         return False
 
+def _clean_expired_blacklist():
+    try:
+        now  = time.time()
+        raw  = _redis.hgetall(BLACKLIST_KEY)
+        exp  = [p for p, v in raw.items() if json.loads(v).get("expires", float("inf")) < now]
+        if exp:
+            _redis.hdel(BLACKLIST_KEY, *exp)
+    except Exception as e:
+        log.error("blacklist_clean_error", extra={"err": str(e)})
+
 def _send_admin_alert(phone, reason):
     if not ADMIN_SMS_TO:
         return
     msg = "\u26a0\ufe0f SafeHarbor Alert\nPhone {} BLACKLISTED\nReason: {}\nTime: {}".format(
         phone, reason, time.strftime("%Y-%m-%d %H:%M:%S"))
-    payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
-               "to": ADMIN_SMS_TO, "type": "text", "text": {"body": msg}}
     try:
-        requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS, json=payload, timeout=10)
+        http_requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS,
+            json={"messaging_product": "whatsapp", "recipient_type": "individual",
+                  "to": ADMIN_SMS_TO, "type": "text", "text": {"body": msg}}, timeout=10)
     except Exception as e:
-        print("[admin alert error] {}".format(e))
+        log.error("admin_alert_error", extra={"err": str(e)})
 
 def rate_limit_check(phone):
     if is_blacklisted(phone):
         return True
     now = time.time()
-    with _rate_lock:
-        _rate_counters[phone] = [t for t in _rate_counters[phone] if now - t < RATE_WINDOW_SEC]
-        if len(_rate_counters[phone]) >= RATE_MAX_MSGS:
+    key = "sh:rate:{}".format(phone)
+    try:
+        pipe = _redis.pipeline()
+        pipe.zremrangebyscore(key, 0, now - RATE_WINDOW_SEC)
+        pipe.zadd(key, {str(now): now})
+        pipe.zcard(key)
+        pipe.expire(key, RATE_WINDOW_SEC)
+        _, _, count, _ = pipe.execute()
+        if count > RATE_MAX_MSGS:
             add_to_blacklist(phone, reason="exceeded {} msgs/min".format(RATE_MAX_MSGS))
             return True
-        _rate_counters[phone].append(now)
+        return False
+    except Exception as e:
+        log.error("rate_limit_error", extra={"err": str(e)})
         return False
 
-# ── WhatsApp senders ──────────────────────────────────────────────────────────
+# WhatsApp senders - FIX 3: retry with backoff
+_RETRY_DELAYS = [1, 3, 10]
+
+def _post_with_retry(payload):
+    last_err = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = http_requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS, json=payload, timeout=15)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", delay * 2))
+                log.warning("meta_rate_limit", extra={"retry_after": wait})
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            last_err = e
+            log.warning("send_attempt_failed", extra={"attempt": attempt + 1, "err": str(e)})
+    log.error("send_failed_all_retries", extra={"err": str(last_err)})
+    return False
 
 def send_message(to, text):
     if not text or not text.strip():
         return
     if not is_allowed_outgoing(text):
-        print("[GUARDIAN] BLOCKED: {}".format(text[:80]))
+        log.warning("guardian_blocked", extra={"text": text[:80]})
         return
-    payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
-               "to": to, "type": "text", "text": {"body": text.strip()}}
-    try:
-        r = requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS, json=payload, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print("[send_message error] {}".format(e))
+    _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
+                      "to": to, "type": "text", "text": {"body": text.strip()}})
 
 def send_logo(to):
-    payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
-               "to": to, "type": "image", "image": {"link": LOGO_URL}}
-    try:
-        r = requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS, json=payload, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print("[send_logo error] {}".format(e))
+    _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
+                      "to": to, "type": "image", "image": {"link": LOGO_URL}})
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── STATE — Redis backend ─────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# State
+STATE_KEY_PREFIX = "sh:state:"
+SEEN_MSG_TTL_SEC = 120
+STATE_TTL_SEC    = 90 * 24 * 3600
 
 _STATE_DEFAULTS = {
-    "tool": "none", "step": 0,
-    "welcomed": False, "round_id": 0,
-    "last_msg_time": 0.0, "wait_count": 0,
-    "grounding_session": 0
+    "tool": "none", "step": 0, "welcomed": False, "round_id": 0,
+    "last_msg_time": 0.0, "wait_count": 0, "grounding_session": 0
 }
 
 def _default_state():
     return dict(_STATE_DEFAULTS)
 
 def get_state(phone):
-    """Read user state from Redis. Returns dict with all keys guaranteed."""
     try:
         raw = _redis.get(STATE_KEY_PREFIX + phone)
         if raw:
@@ -328,24 +399,28 @@ def get_state(phone):
                 s.setdefault(k, v)
             return s
     except Exception as e:
-        print("[redis get_state error] {}".format(e))
+        log.error("get_state_error", extra={"phone": phone, "err": str(e)})
     return _default_state()
 
 def set_state(phone, force_save=False, **kwargs):
-    """Write user state to Redis atomically. force_save is a no-op (Redis is always durable)."""
     try:
-        # Read-modify-write under a Redis-level lock (WATCH would be overkill here;
-        # _phone_locks in handle_message already serialises per-user access)
-        s = get_state(phone)
+        raw = _redis.get(STATE_KEY_PREFIX + phone)
+        s   = json.loads(raw) if raw else _default_state()
+        for k, v in _STATE_DEFAULTS.items():
+            s.setdefault(k, v)
         s.update(kwargs)
-        _redis.set(STATE_KEY_PREFIX + phone, json.dumps(s))
+        _redis.set(STATE_KEY_PREFIX + phone, json.dumps(s), ex=STATE_TTL_SEC)
     except Exception as e:
-        print("[redis set_state error] {}".format(e))
+        log.error("set_state_error", extra={"phone": phone, "err": str(e)})
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── BREATHING ─────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+def _is_duplicate_msg(msg_id):
+    try:
+        return _redis.set("sh:msg:" + msg_id, "1", nx=True, ex=SEEN_MSG_TTL_SEC) is None
+    except Exception as e:
+        log.error("dedup_error", extra={"err": str(e)})
+        return False
 
+# Breathing (runs in RQ worker)
 def breathing_post_round_wait(phone, my_round_id):
     time.sleep(30)
     s = get_state(phone)
@@ -358,33 +433,27 @@ def breathing_post_round_wait(phone, my_round_id):
         return
     send_message(phone, MSG_NUDGE)
 
-# ── FIX 6: reduce get_state() calls in breathing loop from 3x to 1x ──────────
 def run_breathing_round(phone):
-    s = get_state(phone)
-    my_round_id = s["round_id"]
+    my_round_id = None
     for i, part in enumerate(BREATHING_PARTS):
-        # Single state check covers both pre-send and post-sleep conditions
         s = get_state(phone)
+        if my_round_id is None:
+            my_round_id = s["round_id"]
         if s["tool"] != "breathing" or s["round_id"] != my_round_id:
             return
         send_message(phone, part)
         if i < len(BREATHING_PARTS) - 1:
             time.sleep(5)
-            # Check after sleep — if user stopped during the 5s we abort now
             s = get_state(phone)
             if s["tool"] != "breathing" or s["round_id"] != my_round_id:
                 return
-    # Final guard before scheduling nudge
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
     set_state(phone, last_msg_time=time.time())
-    _executor.submit(breathing_post_round_wait, phone, my_round_id)
+    _enqueue(breathing_post_round_wait, phone, my_round_id)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── GROUNDING ─────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# Grounding (runs in RQ worker)
 def nudge_if_silent_grounding(phone, my_step, my_session):
     time.sleep(60)
     s = get_state(phone)
@@ -397,41 +466,27 @@ def nudge_if_silent_grounding(phone, my_step, my_session):
         return
     send_message(phone, GROUNDING_NUDGE_2)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── WELCOME NUDGE ─────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
 def nudge_after_welcome(phone, welcomed_time):
     time.sleep(60)
     s = get_state(phone)
     if s["tool"] == "none" and s["welcomed"] and s["last_msg_time"] <= welcomed_time + 1:
         send_message(phone, MSG_WELCOME_NUDGE)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── WEBHOOK DEDUPLICATION ─────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# Main handler
+_phone_locks      = {}
+_phone_locks_lock = threading.Lock()
 
-# ── Dedup via Redis SET NX + EXPIRE ──────────────────────────────────────────
-# SETNX is atomic: returns 1 (new) or 0 (already exists) in a single round-trip.
-# EXPIRE auto-removes the key after TTL — no manual purge needed.
-def _is_duplicate_msg(msg_id):
-    try:
-        key = "sh:msg:" + msg_id
-        # SET key 1 NX EX ttl — atomic "set if not exists with expiry"
-        result = _redis.set(key, "1", nx=True, ex=SEEN_MSG_TTL_SEC)
-        return result is None   # None = key already existed = duplicate
-    except Exception as e:
-        print("[redis dedup error] {}".format(e))
-        return False  # on Redis error, let message through
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ── MAIN HANDLER ──────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-_phone_locks = defaultdict(threading.Lock)
+def _get_phone_lock(phone):
+    with _phone_locks_lock:
+        if phone not in _phone_locks:
+            if len(_phone_locks) > 10_000:
+                for k in list(_phone_locks)[:5_000]:
+                    del _phone_locks[k]
+            _phone_locks[phone] = threading.Lock()
+        return _phone_locks[phone]
 
 def handle_message(phone, text):
-    with _phone_locks[phone]:
+    with _get_phone_lock(phone):
         _handle_message_inner(phone, text)
 
 def _handle_message_inner(phone, text):
@@ -447,151 +502,158 @@ def _handle_message_inner(phone, text):
         return
 
     if guardian_check_input(text):
-        print("[GUARDIAN] Injection from {}: {}".format(phone, text[:80]))
-        set_state(phone, tool="none", step=0, force_save=True)
+        log.warning("injection_attempt", extra={"phone": phone, "text": text[:80]})
+        set_state(phone, tool="none", step=0)
         send_message(phone, MSG_OFF_TOPIC)
         return
 
-    set_state(phone, last_msg_time=now)
-    # ── FIX 2: re-read state once after update instead of two separate calls ──
-    s    = get_state(phone)
+    s["last_msg_time"] = now
+    try:
+        _redis.set(STATE_KEY_PREFIX + phone, json.dumps(s), ex=STATE_TTL_SEC)
+    except Exception as e:
+        log.error("set_state_error", extra={"phone": phone, "err": str(e)})
+
     tool = s["tool"]
     step = s["step"]
 
-    # 1. Crisis — checked before everything else, always
     if is_crisis(text):
+        log.info("crisis_detected", extra={"phone": phone})
         send_message(phone, MSG_CRISIS)
         return
 
-    # 2. First message
     if not s["welcomed"]:
-        set_state(phone, welcomed=True, force_save=True)
+        set_state(phone, welcomed=True)
         send_logo(phone)
         send_message(phone, MSG_WELCOME)
-        _executor.submit(nudge_after_welcome, phone, now)
+        _enqueue(nudge_after_welcome, phone, now)
         return
 
-    # 3. Breathing
     if tool == "breathing":
         if t in BREATHING_STOP_WORDS:
-            set_state(phone, tool="none", step=0, round_id=s["round_id"] + 1, force_save=True)
+            set_state(phone, tool="none", step=0, round_id=s["round_id"] + 1)
             send_message(phone, MSG_BREATHING_STOP)
         else:
-            new_round = s["round_id"] + 1
-            set_state(phone, round_id=new_round, force_save=True)
-            _executor.submit(run_breathing_round, phone)
+            set_state(phone, round_id=s["round_id"] + 1)
+            _enqueue(run_breathing_round, phone)
         return
 
-    # 4. Grounding
     if tool == "grounding":
         gs = s["grounding_session"]
         if t in GROUNDING_RESET_WORDS:
-            set_state(phone, tool="none", step=0, wait_count=0,
-                      grounding_session=gs + 1, force_save=True)
+            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1)
             send_message(phone, MSG_RESET)
             return
-        if is_grounding_chat(text, step):
+        if is_grounding_chat(text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=GROUNDING_HINTS[step]))
             return
         new_gs    = gs + 1
         next_step = step + 1
         if next_step < len(GROUNDING_STEPS):
-            set_state(phone, step=next_step, wait_count=0,
-                      grounding_session=new_gs, force_save=True)
+            set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs)
             send_message(phone, GROUNDING_STEPS[next_step])
-            _executor.submit(nudge_if_silent_grounding, phone, next_step, new_gs)
+            _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
         else:
-            set_state(phone, tool="none", step=0, wait_count=0,
-                      grounding_session=new_gs, force_save=True)
+            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=new_gs)
             send_message(phone, MSG_RETURNING)
         return
 
-    # 5. Routing
     if text == "א" or t == "a":
-        new_round = s["round_id"] + 1
-        set_state(phone, tool="breathing", step=0, round_id=new_round, force_save=True)
+        set_state(phone, tool="breathing", step=0, round_id=s["round_id"] + 1)
         send_message(phone, BREATHING_START)
-        _executor.submit(run_breathing_round, phone)
+        _enqueue(run_breathing_round, phone)
         return
 
     if text == "ב" or t == "b":
         new_gs = s["grounding_session"] + 1
-        set_state(phone, tool="grounding", step=0, wait_count=0,
-                  grounding_session=new_gs, force_save=True)
+        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs)
         send_message(phone, GROUNDING_STEPS[0])
-        _executor.submit(nudge_if_silent_grounding, phone, 0, new_gs)
+        _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
 
-    # 6. Greeting
     if t in GREET_WORDS:
         send_message(phone, MSG_RETURNING)
         return
 
-    # 7. Unknown
     send_message(phone, MSG_OFF_TOPIC)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ADMIN DASHBOARD ───────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# Admin - FIX 6: header-only auth + rate limit
 def _check_admin_key(req):
-    return (req.headers.get("X-Admin-Key") == ADMIN_API_KEY or
-            req.args.get("key") == ADMIN_API_KEY)
+    return req.headers.get("X-Admin-Key") == ADMIN_API_KEY
 
 @app.route("/admin", methods=["GET"])
 def admin_dashboard():
+    ip = request.remote_addr or "unknown"
+    if not _admin_rate_ok(ip):
+        return jsonify({"error": "too many requests"}), 429
     if not _check_admin_key(request):
-        return '''<html><head><title>SafeHarbor Admin</title>
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;
-        height:100vh;margin:0;background:#f5f5f5}.box{background:#fff;padding:32px;border-radius:12px;
-        box-shadow:0 2px 12px #0002;width:300px}h2{margin:0 0 20px;font-size:18px;color:#333}
-        input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:15px;
-        box-sizing:border-box;margin-bottom:12px}button{width:100%;padding:10px;background:#2563eb;
-        color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer}</style></head>
-        <body><div class="box"><h2>🔒 SafeHarbor Admin</h2><form method="get">
-        <input type="password" name="key" placeholder="Admin key" autofocus>
-        <button type="submit">כניסה</button></form></div></body></html>''', 401
+        return (
+            '<html><head><title>SafeHarbor Admin</title>'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;'
+            'height:100vh;margin:0;background:#f5f5f5}.box{background:#fff;padding:32px;border-radius:12px;'
+            'box-shadow:0 2px 12px #0002;width:340px;text-align:center}h2{margin:0 0 16px;font-size:18px}'
+            'p{color:#666;font-size:14px;margin:0}</style></head>'
+            '<body><div class="box"><h2>SafeHarbor Admin</h2>'
+            '<p>Send <code>X-Admin-Key</code> header to authenticate</p>'
+            '</div></body></html>'
+        ), 401
 
+    _clean_expired_blacklist()
     try:
-        raw = _redis.hgetall(BLACKLIST_KEY)
+        raw     = _redis.hgetall(BLACKLIST_KEY)
         bl_copy = {k: json.loads(v) for k, v in raw.items()}
     except Exception:
         bl_copy = {}
 
     rows = ""
     for phone, info in sorted(bl_copy.items(), key=lambda x: x[1].get("time", 0), reverse=True):
-        rows += '<tr><td style="font-family:monospace">{}</td><td>{}</td><td style="color:#888;font-size:13px">{}</td><td><button onclick="removePhone(\'{}\')" style="background:#dc2626;color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px">הסר</button></td></tr>'.format(
-            phone, info.get("reason", ""), info.get("time_str", ""), phone)
+        rows += (
+            '<tr><td style="font-family:monospace">{}</td><td>{}</td>'
+            '<td style="color:#888;font-size:13px">{}</td>'
+            '<td><button onclick="removePhone(\'{}\')" style="background:#dc2626;color:#fff;'
+            'border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px">הסר</button>'
+            '</td></tr>'
+        ).format(phone, info.get("reason", ""), info.get("time_str", ""), phone)
 
     if not rows:
         rows = '<tr><td colspan="4" style="text-align:center;color:#888;padding:24px">אין מספרים חסומים</td></tr>'
 
-    key = request.args.get("key", "")
-    html = '''<html><head><title>SafeHarbor Admin</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:sans-serif;background:#f5f5f5;padding:24px;direction:rtl}}
-    h1{{font-size:20px;color:#1e293b;margin-bottom:20px}}.card{{background:#fff;border-radius:12px;box-shadow:0 2px 8px #0001;padding:20px;margin-bottom:20px}}
-    table{{width:100%;border-collapse:collapse;font-size:14px}}th{{text-align:right;padding:10px 12px;background:#f8fafc;color:#64748b;font-weight:600;border-bottom:2px solid #e2e8f0}}
-    td{{padding:10px 12px;border-bottom:1px solid #f1f5f9;vertical-align:middle}}.add-row{{display:flex;gap:10px;margin-top:12px}}
-    .add-row input{{flex:1;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px}}
-    .add-row button{{padding:9px 18px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px}}
-    #msg{{padding:10px;border-radius:8px;margin-bottom:16px;display:none;font-size:14px}}</style></head>
-    <body><h1>🔒 SafeHarbor — ניהול רשימה שחורה</h1><div id="msg"></div>
-    <div class="card"><table><thead><tr><th>מספר טלפון</th><th>סיבה</th><th>תאריך</th><th></th></tr></thead>
-    <tbody id="bl-table">{rows}</tbody></table>
-    <div class="add-row"><input id="new-phone" type="text" placeholder="972501234567" dir="ltr">
-    <button onclick="addPhone()">חסום</button></div></div>
-    <script>const KEY="{key}";
-    function showMsg(t,ok){{const e=document.getElementById("msg");e.textContent=t;e.style.display="block";
-    e.style.background=ok?"#dcfce7":"#fee2e2";e.style.color=ok?"#166534":"#dc2626";
-    setTimeout(()=>{{e.style.display="none";}},3000);}}
-    function removePhone(p){{if(!confirm("להסיר "+p+"?"))return;
-    fetch("/admin/blacklist/"+p+"?key="+KEY,{{method:"DELETE"}}).then(r=>r.json()).then(()=>{{showMsg("הוסר: "+p,true);setTimeout(()=>location.reload(),1000);}});}}
-    function addPhone(){{const p=document.getElementById("new-phone").value.trim();if(!p)return;
-    fetch("/admin/blacklist/"+p+"?key="+KEY,{{method:"POST",headers:{{"Content-Type":"application/json"}},
-    body:JSON.stringify({{reason:"manual"}})}}).then(r=>r.json()).then(()=>{{showMsg("נוסף: "+p,true);setTimeout(()=>location.reload(),1000);}});}}
-    </script></body></html>'''.format(rows=rows, key=key)
+    html = (
+        '<html><head><title>SafeHarbor Admin</title>'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>*{box-sizing:border-box;margin:0;padding:0}'
+        'body{font-family:sans-serif;background:#f5f5f5;padding:24px;direction:rtl}'
+        'h1{font-size:20px;color:#1e293b;margin-bottom:20px}'
+        '.card{background:#fff;border-radius:12px;box-shadow:0 2px 8px #0001;padding:20px;margin-bottom:20px}'
+        'table{width:100%;border-collapse:collapse;font-size:14px}'
+        'th{text-align:right;padding:10px 12px;background:#f8fafc;color:#64748b;font-weight:600;border-bottom:2px solid #e2e8f0}'
+        'td{padding:10px 12px;border-bottom:1px solid #f1f5f9;vertical-align:middle}'
+        '.add-row{display:flex;gap:10px;margin-top:12px}'
+        '.add-row input{flex:1;padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px}'
+        '.add-row button{padding:9px 18px;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px}'
+        '#msg{padding:10px;border-radius:8px;margin-bottom:16px;display:none;font-size:14px}</style></head>'
+        '<body><h1>SafeHarbor — ניהול רשימה שחורה</h1><div id="msg"></div>'
+        '<div class="card"><table><thead>'
+        '<tr><th>מספר טלפון</th><th>סיבה</th><th>תאריך</th><th></th></tr>'
+        '</thead><tbody id="bl-table">' + rows + '</tbody></table>'
+        '<div class="add-row">'
+        '<input id="new-phone" type="text" placeholder="972501234567" dir="ltr">'
+        '<button onclick="addPhone()">חסום</button></div></div>'
+        '<script>'
+        'const AK=document.cookie.match(/adminKey=([^;]+)/)?.[1]||"";'
+        'const H={"X-Admin-Key":AK};'
+        'function showMsg(t,ok){const e=document.getElementById("msg");e.textContent=t;e.style.display="block";'
+        'e.style.background=ok?"#dcfce7":"#fee2e2";e.style.color=ok?"#166534":"#dc2626";'
+        'setTimeout(()=>e.style.display="none",3000);}'
+        'function removePhone(p){if(!confirm("להסיר "+p+"?"))return;'
+        'fetch("/admin/blacklist/"+p,{method:"DELETE",headers:H})'
+        '.then(r=>r.json()).then(()=>{showMsg("הוסר: "+p,true);setTimeout(()=>location.reload(),1000);});}'
+        'function addPhone(){const p=document.getElementById("new-phone").value.trim();if(!p)return;'
+        'fetch("/admin/blacklist/"+p,{method:"POST",headers:{...H,"Content-Type":"application/json"},'
+        'body:JSON.stringify({reason:"manual"})})'
+        '.then(r=>r.json()).then(()=>{showMsg("נוסף: "+p,true);setTimeout(()=>location.reload(),1000);});}'
+        '</script></body></html>'
+    )
     return html, 200
 
 @app.route("/admin/blacklist", methods=["GET"])
@@ -600,7 +662,7 @@ def admin_list_blacklist():
         return jsonify({"error": "unauthorized"}), 401
     try:
         raw = _redis.hgetall(BLACKLIST_KEY)
-        bl = {k: json.loads(v) for k, v in raw.items()}
+        bl  = {k: json.loads(v) for k, v in raw.items()}
     except Exception:
         bl = {}
     return jsonify({"blacklist": bl, "count": len(bl)}), 200
@@ -619,10 +681,7 @@ def admin_add_blacklist(phone):
     add_to_blacklist(phone, reason=reason)
     return jsonify({"status": "blacklisted", "phone": phone}), 200
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── WEBHOOK ───────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# Webhook
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode      = request.args.get("hub.mode")
@@ -643,18 +702,36 @@ def receive_message():
                     if msg.get("type") == "text":
                         msg_id = msg.get("id", "")
                         if msg_id and _is_duplicate_msg(msg_id):
-                            print("[DEDUP] Duplicate webhook ignored: {}".format(msg_id))
+                            log.info("dedup_blocked", extra={"msg_id": msg_id})
                             continue
                         phone = msg["from"]
                         text  = msg["text"]["body"]
-                        _executor.submit(handle_message, phone, text)
+                        _enqueue(handle_message, phone, text)
     except Exception as e:
-        print("[webhook error] {}".format(e))
+        log.error("webhook_error", extra={"err": str(e)})
     return jsonify({"status": "ok"}), 200
 
-@app.route("/", methods=["GET"])
+# Health check - FIX 9
+@app.route("/health", methods=["GET"])
 def health():
-    return "SafeHarbor Bot is running v35", 200
+    redis_ok = False
+    try:
+        _redis.ping()
+        redis_ok = True
+    except Exception:
+        pass
+    status = 200 if redis_ok else 503
+    return jsonify({
+        "status":  "ok" if redis_ok else "degraded",
+        "version": "v37",
+        "uptime":  int(time.time() - _START_TIME),
+        "redis":   "ok" if redis_ok else "error",
+        "queue":   "rq" if _USE_RQ else "threadpool",
+    }), status
+
+@app.route("/", methods=["GET"])
+def root():
+    return "SafeHarbor Bot is running v37", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
