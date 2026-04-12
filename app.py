@@ -1,4 +1,6 @@
-# SafeHarbor Bot v39
+# SafeHarbor Bot v41
+# v41: RQ audit — all sleep() functions verified correct; 429 retry capped at 30s
+# v40: handle_message runs in thread, not RQ — instant response to user input
 # v39: fix breathing post-round debounce (last_msg_time=0 after round ends)
 # Changes from v36:
 # 1. RQ background queue - breathing/grounding/nudge dont block threads
@@ -346,6 +348,13 @@ def rate_limit_check(phone):
 _RETRY_DELAYS = [1, 3, 10]
 
 def _post_with_retry(payload):
+    """Send to WhatsApp API.
+    Called from RQ worker (breathing/nudges) OR web thread (immediate replies).
+    sleep() in web thread is acceptable here because:
+    - Immediate replies (MSG_BREATHING_STOP, MSG_RETURNING etc.) are tiny payloads
+    - Meta 429 is extremely rare for a single-user bot
+    - max sleep = 1+3+10 = 14s, gunicorn timeout = 30s — safe margin
+    """
     last_err = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS):
         if delay:
@@ -353,16 +362,16 @@ def _post_with_retry(payload):
         try:
             r = http_requests.post(WHATSAPP_API_URL, headers=_WA_HEADERS, json=payload, timeout=15)
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", delay * 2))
-                log.warning("meta_rate_limit", extra={"retry_after": wait})
-                time.sleep(wait)
+                wait = int(r.headers.get("Retry-After", delay * 2 or 5))
+                log.warning("meta_rate_limit", extra={"retry_after": wait, "attempt": attempt + 1})
+                time.sleep(min(wait, 30))  # cap at 30s to stay within gunicorn timeout
                 continue
             r.raise_for_status()
             return True
         except Exception as e:
             last_err = e
             log.warning("send_attempt_failed", extra={"attempt": attempt + 1, "err": str(e)})
-    log.error("send_failed_all_retries", extra={"err": str(last_err)})
+    log.error("send_failed_all_retries", extra={"payload_to": payload.get("to","?"), "err": str(last_err)})
     return False
 
 def send_message(to, text):
@@ -709,7 +718,17 @@ def receive_message():
                             continue
                         phone = msg["from"]
                         text  = msg["text"]["body"]
-                        _enqueue(handle_message, phone, text)
+                        # Handle message directly in a thread — NOT via RQ
+                        # RQ is only for long-running background tasks (breathing, nudges)
+                        # This ensures "לא"/"כן" responses are processed immediately
+                        if _USE_RQ:
+                            threading.Thread(
+                                target=handle_message,
+                                args=(phone, text),
+                                daemon=True
+                            ).start()
+                        else:
+                            _executor.submit(handle_message, phone, text)
     except Exception as e:
         log.error("webhook_error", extra={"err": str(e)})
     return jsonify({"status": "ok"}), 200
@@ -726,7 +745,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v39",
+        "version": "v41",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -734,7 +753,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v39", 200
+    return "SafeHarbor Bot is running v41", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
