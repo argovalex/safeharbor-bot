@@ -1,4 +1,4 @@
-# SafeHarbor Bot v37 - Production Ready
+# SafeHarbor Bot v38 - Production Ready
 # Changes from v36:
 # 1. RQ background queue - breathing/grounding/nudge dont block threads
 # 2. Rate limiting via Redis sliding window - works across multiple workers
@@ -422,15 +422,16 @@ def _is_duplicate_msg(msg_id):
 
 # Breathing (runs in RQ worker)
 def breathing_post_round_wait(phone, my_round_id):
-    time.sleep(30)
+    # Wait 90s before first nudge - gives user enough time to respond "כן"/"לא"
+    time.sleep(90)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        return
+        return  # user already responded - abort
     send_message(phone, MSG_NUDGE)
-    time.sleep(60)
+    time.sleep(90)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        return
+        return  # user responded during second wait
     send_message(phone, MSG_NUDGE)
 
 def run_breathing_round(phone):
