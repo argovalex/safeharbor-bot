@@ -1,4 +1,5 @@
-# SafeHarbor Bot v38 - Production Ready
+# SafeHarbor Bot v39
+# v39: fix breathing post-round debounce (last_msg_time=0 after round ends)
 # Changes from v36:
 # 1. RQ background queue - breathing/grounding/nudge dont block threads
 # 2. Rate limiting via Redis sliding window - works across multiple workers
@@ -451,7 +452,8 @@ def run_breathing_round(phone):
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
-    set_state(phone, last_msg_time=time.time())
+    # Reset last_msg_time to 0 so debounce does NOT block the user's "כן"/"לא" response
+    set_state(phone, last_msg_time=0.0)
     _enqueue(breathing_post_round_wait, phone, my_round_id)
 
 # Grounding (runs in RQ worker)
@@ -724,7 +726,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v37",
+        "version": "v39",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -732,7 +734,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v37", 200
+    return "SafeHarbor Bot is running v39", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
