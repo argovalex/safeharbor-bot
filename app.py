@@ -1,4 +1,5 @@
-# SafeHarbor Bot v41
+# SafeHarbor Bot v42
+# v42: logo order fix + dedicated thread pool for instant message handling
 # v41: RQ audit — all sleep() functions verified correct; 429 retry capped at 30s
 # v40: handle_message runs in thread, not RQ — instant response to user input
 # v39: fix breathing post-round debounce (last_msg_time=0 after round ends)
@@ -79,23 +80,26 @@ _redis = redis_lib.from_url(
     health_check_interval=30,
 )
 
-# RQ background queue - FIX 1
+# Thread pool for immediate message handling (web server side)
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_msg_executor = _TPE(max_workers=30)  # handles user messages instantly
+
+# RQ background queue for long-running tasks (breathing, nudges)
 try:
     from rq import Queue as _RQ_Queue
     _rq     = _RQ_Queue("safeharbor", connection=_redis)
     _USE_RQ = True
     log.info("rq_initialized")
 except ImportError:
-    from concurrent.futures import ThreadPoolExecutor as _TPE
-    _executor = _TPE(max_workers=20)
-    _USE_RQ   = False
+    _USE_RQ = False
     log.warning("rq_not_installed_fallback_threadpool")
 
 def _enqueue(fn, *args):
+    """Long-running background tasks — RQ worker or thread pool."""
     if _USE_RQ:
         _rq.enqueue(fn, *args, job_timeout=300)
     else:
-        _executor.submit(fn, *args)
+        _msg_executor.submit(fn, *args)
 
 # Admin rate limit
 ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
@@ -536,6 +540,7 @@ def _handle_message_inner(phone, text):
     if not s["welcomed"]:
         set_state(phone, welcomed=True)
         send_logo(phone)
+        time.sleep(0.5)  # ensure logo arrives before welcome text
         send_message(phone, MSG_WELCOME)
         _enqueue(nudge_after_welcome, phone, now)
         return
@@ -721,14 +726,8 @@ def receive_message():
                         # Handle message directly in a thread — NOT via RQ
                         # RQ is only for long-running background tasks (breathing, nudges)
                         # This ensures "לא"/"כן" responses are processed immediately
-                        if _USE_RQ:
-                            threading.Thread(
-                                target=handle_message,
-                                args=(phone, text),
-                                daemon=True
-                            ).start()
-                        else:
-                            _executor.submit(handle_message, phone, text)
+                        # Always use thread pool — instant, never queued behind RQ jobs
+                        _msg_executor.submit(handle_message, phone, text)
     except Exception as e:
         log.error("webhook_error", extra={"err": str(e)})
     return jsonify({"status": "ok"}), 200
@@ -745,7 +744,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v41",
+        "version": "v42",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -753,7 +752,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v41", 200
+    return "SafeHarbor Bot is running v42", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
