@@ -1,4 +1,4 @@
-# SafeHarbor Bot v48
+# SafeHarbor Bot v49
 # v48: תיקון Unicode RTL/LTR marks — WhatsApp שולח תווי כיוון שlא נגרעים ע"י strip();
 #      "כן" עם \u200f לא נזהה כ-BREATHING_YES_WORDS;
 #      פתרון: clean_text() שמסיר כל תווי בקרה unicode לפני כל השוואה
@@ -695,58 +695,50 @@ def _increment_daily_sessions(phone):
 # ─────────────────────────────────────────────
 def breathing_post_round_wait(phone, my_round_id):
     """
-    v48: ממתין אחרי שאלת "נמשיך?" לפני שליחת nudge.
-    בודק waiting_confirm לפני כל nudge —
-    אם המשתמש כבר ענה (כן/לא), לא מפריעים.
-    לוגיקה:
-      - ממתין 3 דקות (180s)
-      - אם המשתמש ענה (waiting_confirm=False) — יוצאים בשקט
-      - אם עדיין לא ענה — שולח nudge עדין אחד
-      - ממתין עוד 2 דקות (120s)
-      - אם עדיין לא ענה — nudge שני
-    round_id מגן מפני race condition.
+    v49: אחרי "נמשיך?" — ממתין 120 שניות.
+    אם המשתמש לא ענה → מתייחסים כ"לא" ויוצאים מהתרגיל.
+    אם המשתמש ענה בינתיים (round_id שונה או tool שונה) → לא עושים כלום.
     """
-    # המתנה ראשונית — 3 דקות
-    time.sleep(180)
-    s = get_state(phone)
-    # בדיקה כפולה: round_id + waiting_confirm
-    # אם waiting_confirm=False — המשתמש כבר ענה כן/לא, לא מפריעים
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id or not s.get("waiting_confirm"):
-        return
-    send_message(phone, MSG_NUDGE)
-
-    # המתנה שנייה — עוד 2 דקות
     time.sleep(120)
     s = get_state(phone)
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id or not s.get("waiting_confirm"):
+    # אם המשתמש ענה כן → round_id גדל → נצא בשקט
+    # אם המשתמש ענה לא → tool="none" → נצא בשקט
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
-    send_message(phone, MSG_NUDGE)
+    # לא ענה תוך 120s — מתייחסים כ"לא"
+    log.info("breathing_timeout_exit", extra={"phone": phone})
+    set_state(phone, tool="none", step=0, round_id=my_round_id + 1, waiting_confirm=False)
+    send_message(phone, MSG_BREATHING_STOP)
 
 def run_breathing_round(phone):
     """
-    מריץ סבב נשימה; בודק round_id אחרי כל sleep לעצירה מיידית.
-    v46: בסיום מציב waiting_confirm=True — הבוט ממתין לכן/לא,
-    לא מתחיל סבב חדש אוטומטית.
+    v49: מריץ סבב נשימה שלם — 13 הודעות עם 5s ביניהן.
+    בסיום: מציב waiting_confirm=True ומפעיל טיימר של 120s.
+    בודק round_id אחרי כל sleep — עצירה מיידית אם המשתמש יצא.
     """
-    my_round_id = None
+    s = get_state(phone)
+    my_round_id = s["round_id"]
+
+    if s["tool"] != "breathing":
+        return
+
     for i, part in enumerate(BREATHING_PARTS):
+        # בדיקה לפני כל שליחה
         s = get_state(phone)
-        if my_round_id is None:
-            my_round_id = s["round_id"]
         if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+            log.info("breathing_aborted", extra={"phone": phone, "step": i})
             return
         send_message(phone, part)
         if i < len(BREATHING_PARTS) - 1:
             time.sleep(5)
-            s = get_state(phone)
-            if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-                log.info("breathing_round_aborted", extra={"phone": phone, "step": i})
-                return
+
+    # סיום הסבב — בודק פעם אחרונה
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
-    # v46: מציבים waiting_confirm=True ומאפסים debounce
-    # הבוט עכשיו ממתין לתשובת המשתמש — לא מתחיל סבב חדש
+
+    # מציב waiting_confirm=True ומפעיל טיימר
+    # last_msg_time=0.0 מאפס debounce כדי שתגובת כן/לא תתקבל מיד
     set_state(phone, last_msg_time=0.0, waiting_confirm=True)
     _enqueue(breathing_post_round_wait, phone, my_round_id)
 
@@ -886,27 +878,23 @@ def _handle_message_inner(phone, text):
 
     # ── שלב 7: תרגיל נשימה פעיל ──
     if tool == "breathing":
+
+        # לא — עוצר ויוצא
         if t in BREATHING_STOP_WORDS:
-            # המשתמש עצר — מנקים state
-            set_state(phone, tool="none", step=0, round_id=s["round_id"] + 1,
-                      waiting_confirm=False)
+            set_state(phone, tool="none", step=0,
+                      round_id=s["round_id"] + 1, waiting_confirm=False)
             send_message(phone, MSG_BREATHING_STOP)
             return
 
-        if s.get("waiting_confirm"):
-            # v46: הבוט ממתין לתשובת "נמשיך?" — רק כן/לא תקין
-            # כן → סבב נוסף | לא (כבר תופס למעלה ב-BREATHING_STOP_WORDS)
-            if t in BREATHING_YES_WORDS:
-                set_state(phone, round_id=s["round_id"] + 1, waiting_confirm=False)
-                _enqueue(run_breathing_round, phone)
-            else:
-                # כל תשובה אחרת שאינה "לא" — מזכירים שממתינים לתשובה
-                send_message(phone, MSG_BREATHING_WAIT_CONFIRM)
+        # כן — מתחיל סבב חדש מיד
+        if t in BREATHING_YES_WORDS:
+            new_round = s["round_id"] + 1
+            set_state(phone, round_id=new_round, waiting_confirm=False)
+            _enqueue(run_breathing_round, phone)
             return
 
-        # לא waiting_confirm ולא stop → סבב חדש (מגיע רק מבחירת "א" ראשונית)
-        set_state(phone, round_id=s["round_id"] + 1, waiting_confirm=False)
-        _enqueue(run_breathing_round, phone)
+        # כל דבר אחר — תזכורת
+        send_message(phone, MSG_BREATHING_WAIT_CONFIRM)
         return
 
     # ── שלב 8: תרגיל קרקוע פעיל ──
@@ -1132,7 +1120,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v48",
+        "version": "v49",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -1140,7 +1128,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v48", 200
+    return "SafeHarbor Bot is running v49", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
