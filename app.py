@@ -1,7 +1,7 @@
-# SafeHarbor Bot v46
-# v46: תיקון באג נשימה — הוספת waiting_confirm state;
-#      הבוט ממתין לתשובת כן/לא אחרי "נמשיך?" ולא מתחיל סבב מיד;
-#      "כתוב" → "הקש" בכל הודעות הבחירה
+# SafeHarbor Bot v47
+# v47: תיקון breathing_post_round_wait — בודק waiting_confirm לפני nudge;
+#      nudge נשלח רק אם המשתמש לא ענה כלל אחרי 3 דקות;
+#      אם ענה (waiting_confirm=False) — לא מפריעים
 #      1. is_crisis רץ לפני rate_limit_check — משבר תמיד מקבל עדיפות
 #      2. is_crisis משתמש ב-_normalize_text (מונע obfuscation)
 #      3. _CRISIS_WORDS הורחב: ביטויים 2025-2026, passive ideation נוספים, אנגלית
@@ -676,15 +676,29 @@ def _increment_daily_sessions(phone):
 # תרגיל נשימה — background
 # ─────────────────────────────────────────────
 def breathing_post_round_wait(phone, my_round_id):
-    """שולח nudge אחרי 90s אם המשתמש לא הגיב; בודק round_id"""
-    time.sleep(90)
+    """
+    v47: ממתין אחרי שאלת "נמשיך?" לפני שליחת nudge.
+    הלוגיקה:
+      - ממתין 3 דקות (180s)
+      - אם המשתמש ענה (waiting_confirm=False) — לא עושים כלום
+      - אם עדיין לא ענה — שולח nudge עדין אחד
+      - ממתין עוד 2 דקות (120s)
+      - אם עדיין לא ענה — nudge שני + רמז לתפריט
+    round_id מגן מפני race condition: אם השתנה — המשתמש כבר בחר.
+    """
+    # המתנה ראשונית — 3 דקות
+    time.sleep(180)
     s = get_state(phone)
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+    # בדיקה כפולה: round_id + waiting_confirm
+    # אם waiting_confirm=False — המשתמש כבר ענה כן/לא, לא מפריעים
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id or not s.get("waiting_confirm"):
         return
     send_message(phone, MSG_NUDGE)
-    time.sleep(90)
+
+    # המתנה שנייה — עוד 2 דקות
+    time.sleep(120)
     s = get_state(phone)
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+    if s["tool"] != "breathing" or s["round_id"] != my_round_id or not s.get("waiting_confirm"):
         return
     send_message(phone, MSG_NUDGE)
 
@@ -1096,7 +1110,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v46",
+        "version": "v47",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -1104,7 +1118,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v46", 200
+    return "SafeHarbor Bot is running v47", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
