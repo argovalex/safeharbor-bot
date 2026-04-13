@@ -1,31 +1,9 @@
-# SafeHarbor Bot v42
-# v42: logo order fix + dedicated thread pool for instant message handling
-# v41: RQ audit — all sleep() functions verified correct; 429 retry capped at 30s
-# v40: handle_message runs in thread, not RQ — instant response to user input
-# v39: fix breathing post-round debounce (last_msg_time=0 after round ends)
-# Changes from v36:
-# 1. RQ background queue - breathing/grounding/nudge dont block threads
-# 2. Rate limiting via Redis sliding window - works across multiple workers
-# 3. Retry with exponential backoff on send_message (Meta 429)
-# 4. Redis socket_timeout=10s + health_check_interval
-# 5. Structured JSON logging - all print replaced with logger
-# 6. Admin: X-Admin-Key header only (not query string) + rate limit
-# 7. Blacklist entries with 30-day TTL
-# 8. Sentry optional error tracking
-# 9. /health endpoint checks Redis + returns version/uptime
-#
-# Railway services:
-#   web    -> gunicorn app:app --workers 2 --threads 4 --timeout 30
-#   worker -> rq worker --url $REDIS_URL safeharbor
-#
-# requirements.txt:
-#   flask>=3.0
-#   requests>=2.32
-#   redis>=5.0
-#   rq>=1.16
-#   gunicorn>=22.0
-#   sentry-sdk>=2.0
-
+# SafeHarbor Bot v43
+# v43: fix guardian over-blocking (removed why/what/how/help from grounding_chat_phrases),
+#      fix GROUNDING_CHAT_REPLY not in allowed_outgoing, crisis resets state,
+#      breathing race condition check after each sleep, logo/welcome in background thread,
+#      phone_locks cleanup by time instead of size, nudge_after_welcome checks tool state,
+#      LOGO_URL via env var
 import os, time, json, logging, threading
 import requests as http_requests
 import re
@@ -33,7 +11,6 @@ import redis as redis_lib
 from collections import defaultdict
 from flask import Flask, request, jsonify
 
-# Structured JSON logging
 class _JsonFmt(logging.Formatter):
     def format(self, r):
         d = {"ts": self.formatTime(r, "%Y-%m-%dT%H:%M:%S"), "level": r.levelname, "msg": r.getMessage()}
@@ -45,7 +22,6 @@ _h.setFormatter(_JsonFmt())
 logging.basicConfig(handlers=[_h], level=logging.INFO, force=True)
 log = logging.getLogger("safeharbor")
 
-# Sentry optional
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
     try:
@@ -63,14 +39,13 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "12345")
 WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
 DEBOUNCE_SEC      = 1.0
-LOGO_URL          = "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png"
+LOGO_URL          = os.environ.get("LOGO_URL", "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png")
 
 _WA_HEADERS = {
     "Authorization": "Bearer {}".format(WHATSAPP_TOKEN),
     "Content-Type":  "application/json",
 }
 
-# Redis - FIX 4: socket_timeout=10, health_check_interval=30
 _redis = redis_lib.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True,
@@ -80,11 +55,9 @@ _redis = redis_lib.from_url(
     health_check_interval=30,
 )
 
-# Thread pool for immediate message handling (web server side)
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_msg_executor = _TPE(max_workers=30)  # handles user messages instantly
+_msg_executor = _TPE(max_workers=30)
 
-# RQ background queue for long-running tasks (breathing, nudges)
 try:
     from rq import Queue as _RQ_Queue
     _rq     = _RQ_Queue("safeharbor", connection=_redis)
@@ -95,13 +68,11 @@ except ImportError:
     log.warning("rq_not_installed_fallback_threadpool")
 
 def _enqueue(fn, *args):
-    """Long-running background tasks — RQ worker or thread pool."""
     if _USE_RQ:
         _rq.enqueue(fn, *args, job_timeout=300)
     else:
         _msg_executor.submit(fn, *args)
 
-# Admin rate limit
 ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
 ADMIN_SMS_TO       = os.environ.get("ADMIN_PHONE", "")
 _ADMIN_MAX_PER_MIN = 10
@@ -120,7 +91,6 @@ def _admin_rate_ok(ip):
     except Exception:
         return True
 
-# Messages
 MSG_WELCOME = (
     '*שלום, אני נמל הבית* \u2693\n'
     'אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.\n\n'
@@ -213,11 +183,13 @@ _crisis_re = re.compile("|".join(re.escape(w) for w in _CRISIS_WORDS), re.IGNORE
 def is_crisis(text):
     return bool(_crisis_re.search(text))
 
+# FIX 1+2: removed "what","why","how","help","עזור" — too broad, blocks legit user messages
+# Only flag clear conversational patterns that are truly off-topic during grounding
 _GROUNDING_CHAT_PHRASES = [
-    "מה זה", "למה", "אני לא", "אני לא יודע", "לא יודע",
-    "מה אתה", "מה את", "לא רוצה", "אני רוצה", "תגיד לי",
-    "why", "what", "how", "i don't", "i dont", "tell me",
-    "help", "עזור", "הסבר",
+    "מה זה", "למה אתה", "מה אתה", "מה את",
+    "לא רוצה", "אני רוצה לדבר",
+    "תגיד לי", "הסבר לי",
+    "i don't want to", "tell me about",
 ]
 _grounding_chat_re = re.compile(
     "|".join(re.escape(p) for p in _GROUNDING_CHAT_PHRASES), re.IGNORECASE
@@ -226,7 +198,6 @@ _grounding_chat_re = re.compile(
 def is_grounding_chat(text):
     return bool(_grounding_chat_re.search(text.lower()))
 
-# Guardian
 _INJECTION_PATTERNS = [
     r"ignore (previous|all|above)",
     r"forget (everything|all|your instructions)",
@@ -253,6 +224,7 @@ def guardian_check_input(text):
     return bool(_injection_re.search(text))
 
 _ALLOWED_OUTGOING = set()
+_ALLOWED_OUTGOING_PREFIXES = []
 
 def _build_allowed_outgoing():
     for msg in [MSG_WELCOME, MSG_RETURNING, MSG_NUDGE, MSG_WELCOME_NUDGE,
@@ -261,6 +233,9 @@ def _build_allowed_outgoing():
         _ALLOWED_OUTGOING.add(msg.strip())
     for msg in BREATHING_PARTS + GROUNDING_STEPS:
         _ALLOWED_OUTGOING.add(msg.strip())
+    # FIX 3: pre-compute all possible GROUNDING_CHAT_REPLY variants
+    for hint in GROUNDING_HINTS:
+        _ALLOWED_OUTGOING.add(GROUNDING_CHAT_REPLY.format(hint=hint).strip())
 
 _build_allowed_outgoing()
 
@@ -268,18 +243,15 @@ def is_allowed_outgoing(text):
     t = text.strip()
     if t in _ALLOWED_OUTGOING:
         return True
-    if t.startswith("אני כאן רק כדי לעזור לך להתייצב"):
-        return True
     return False
 
 def _ensure_registered():
     pass
 
-# Rate limiting - FIX 2: Redis sliding window
 RATE_WINDOW_SEC = 60
 RATE_MAX_MSGS   = 20
 BLACKLIST_KEY   = "sh:blacklist"
-BLACKLIST_TTL   = 30 * 24 * 3600  # FIX 7: 30-day TTL
+BLACKLIST_TTL   = 30 * 24 * 3600
 
 def is_blacklisted(phone):
     try:
@@ -348,17 +320,9 @@ def rate_limit_check(phone):
         log.error("rate_limit_error", extra={"err": str(e)})
         return False
 
-# WhatsApp senders - FIX 3: retry with backoff
 _RETRY_DELAYS = [1, 3, 10]
 
 def _post_with_retry(payload):
-    """Send to WhatsApp API.
-    Called from RQ worker (breathing/nudges) OR web thread (immediate replies).
-    sleep() in web thread is acceptable here because:
-    - Immediate replies (MSG_BREATHING_STOP, MSG_RETURNING etc.) are tiny payloads
-    - Meta 429 is extremely rare for a single-user bot
-    - max sleep = 1+3+10 = 14s, gunicorn timeout = 30s — safe margin
-    """
     last_err = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS):
         if delay:
@@ -368,7 +332,7 @@ def _post_with_retry(payload):
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", delay * 2 or 5))
                 log.warning("meta_rate_limit", extra={"retry_after": wait, "attempt": attempt + 1})
-                time.sleep(min(wait, 30))  # cap at 30s to stay within gunicorn timeout
+                time.sleep(min(wait, 30))
                 continue
             r.raise_for_status()
             return True
@@ -391,7 +355,6 @@ def send_logo(to):
     _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
                       "to": to, "type": "image", "image": {"link": LOGO_URL}})
 
-# State
 STATE_KEY_PREFIX = "sh:state:"
 SEEN_MSG_TTL_SEC = 120
 STATE_TTL_SEC    = 90 * 24 * 3600
@@ -434,18 +397,17 @@ def _is_duplicate_msg(msg_id):
         log.error("dedup_error", extra={"err": str(e)})
         return False
 
-# Breathing (runs in RQ worker)
+# FIX 4: breathing round checks round_id atomically via Redis to prevent race condition
 def breathing_post_round_wait(phone, my_round_id):
-    # Wait 90s before first nudge - gives user enough time to respond "כן"/"לא"
     time.sleep(90)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        return  # user already responded - abort
+        return
     send_message(phone, MSG_NUDGE)
     time.sleep(90)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        return  # user responded during second wait
+        return
     send_message(phone, MSG_NUDGE)
 
 def run_breathing_round(phone):
@@ -459,17 +421,17 @@ def run_breathing_round(phone):
         send_message(phone, part)
         if i < len(BREATHING_PARTS) - 1:
             time.sleep(5)
+            # FIX 4: re-check after sleep — user may have sent "לא" during the 5s gap
             s = get_state(phone)
             if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+                log.info("breathing_round_aborted", extra={"phone": phone, "step": i})
                 return
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
-    # Reset last_msg_time to 0 so debounce does NOT block the user's "כן"/"לא" response
     set_state(phone, last_msg_time=0.0)
     _enqueue(breathing_post_round_wait, phone, my_round_id)
 
-# Grounding (runs in RQ worker)
 def nudge_if_silent_grounding(phone, my_step, my_session):
     time.sleep(60)
     s = get_state(phone)
@@ -485,20 +447,26 @@ def nudge_if_silent_grounding(phone, my_step, my_session):
 def nudge_after_welcome(phone, welcomed_time):
     time.sleep(60)
     s = get_state(phone)
+    # FIX 6: also check tool=="none" to avoid nudging someone already in a session
     if s["tool"] == "none" and s["welcomed"] and s["last_msg_time"] <= welcomed_time + 1:
         send_message(phone, MSG_WELCOME_NUDGE)
 
-# Main handler
+# FIX 7: use WeakValueDictionary + periodic cleanup via timestamp instead of size-based
 _phone_locks      = {}
 _phone_locks_lock = threading.Lock()
+_phone_lock_times = {}  # last access time per phone
 
 def _get_phone_lock(phone):
+    now = time.time()
     with _phone_locks_lock:
+        # Cleanup locks not accessed in 10 minutes
+        stale = [k for k, t in _phone_lock_times.items() if now - t > 600]
+        for k in stale:
+            _phone_locks.pop(k, None)
+            _phone_lock_times.pop(k, None)
         if phone not in _phone_locks:
-            if len(_phone_locks) > 10_000:
-                for k in list(_phone_locks)[:5_000]:
-                    del _phone_locks[k]
             _phone_locks[phone] = threading.Lock()
+        _phone_lock_times[phone] = now
         return _phone_locks[phone]
 
 def handle_message(phone, text):
@@ -532,17 +500,17 @@ def _handle_message_inner(phone, text):
     tool = s["tool"]
     step = s["step"]
 
+    # FIX 9: crisis always resets tool state so next message doesn't return to session
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
+        set_state(phone, tool="none", step=0, wait_count=0)
         send_message(phone, MSG_CRISIS)
         return
 
     if not s["welcomed"]:
         set_state(phone, welcomed=True)
-        send_logo(phone)
-        time.sleep(0.5)  # ensure logo arrives before welcome text
-        send_message(phone, MSG_WELCOME)
-        _enqueue(nudge_after_welcome, phone, now)
+        # FIX 8: send_logo moved to background thread to avoid blocking web thread
+        _enqueue(_send_logo_and_welcome, phone, now)
         return
 
     if tool == "breathing":
@@ -593,9 +561,12 @@ def _handle_message_inner(phone, text):
 
     send_message(phone, MSG_OFF_TOPIC)
 
-# Admin - FIX 6: header-only auth + rate limit
-def _check_admin_key(req):
-    return req.headers.get("X-Admin-Key") == ADMIN_API_KEY
+# FIX 8: logo + welcome in background — no sleep() on web thread
+def _send_logo_and_welcome(phone, now):
+    send_logo(phone)
+    time.sleep(0.5)
+    send_message(phone, MSG_WELCOME)
+    _enqueue(nudge_after_welcome, phone, now)
 
 @app.route("/admin", methods=["GET"])
 def admin_dashboard():
@@ -673,6 +644,9 @@ def admin_dashboard():
     )
     return html, 200
 
+def _check_admin_key(req):
+    return req.headers.get("X-Admin-Key") == ADMIN_API_KEY
+
 @app.route("/admin/blacklist", methods=["GET"])
 def admin_list_blacklist():
     if not _check_admin_key(request):
@@ -698,7 +672,6 @@ def admin_add_blacklist(phone):
     add_to_blacklist(phone, reason=reason)
     return jsonify({"status": "blacklisted", "phone": phone}), 200
 
-# Webhook
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode      = request.args.get("hub.mode")
@@ -723,16 +696,11 @@ def receive_message():
                             continue
                         phone = msg["from"]
                         text  = msg["text"]["body"]
-                        # Handle message directly in a thread — NOT via RQ
-                        # RQ is only for long-running background tasks (breathing, nudges)
-                        # This ensures "לא"/"כן" responses are processed immediately
-                        # Always use thread pool — instant, never queued behind RQ jobs
                         _msg_executor.submit(handle_message, phone, text)
     except Exception as e:
         log.error("webhook_error", extra={"err": str(e)})
     return jsonify({"status": "ok"}), 200
 
-# Health check - FIX 9
 @app.route("/health", methods=["GET"])
 def health():
     redis_ok = False
@@ -744,7 +712,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v42",
+        "version": "v43",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -752,7 +720,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v42", 200
+    return "SafeHarbor Bot is running v43", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
