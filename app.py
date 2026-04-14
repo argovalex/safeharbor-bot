@@ -1,9 +1,8 @@
-# SafeHarbor Bot v50
-# תיקון v50: נשימה — כן מתחיל סבב מיד (ללא המתנה)
-#   - הוסר breathing_post_round_wait (גרם לעיכוב של 120s)
-#   - נוסף breathing_timeout_nudge: אם אין תגובה תוך 60s → יוצא עם MSG_BREATHING_STOP
-#   - run_breathing_round: בסיום סבב מציב waiting_confirm=True ומפעיל timeout של 60s
-#   - כשמקבלים "כן": round_id+1 → run_breathing_round מתחיל מיד ב-background
+# SafeHarbor Bot v51
+# תיקון v51: run_breathing_round מקבל forced_round_id ישירות
+#   — מונע race condition בין set_state ל-get_state ב-thread חדש
+#   — breathing_timeout_nudge גם מקבל my_round_id (לא השתנה)
+#   — כן → new_round מחושב → מועבר ישירות ל-run_breathing_round
 
 import os, time, json, logging, threading
 import requests as http_requests
@@ -11,9 +10,6 @@ import re
 import redis as redis_lib
 from flask import Flask, request, jsonify
 
-# ─────────────────────────────────────────────
-# לוגינג
-# ─────────────────────────────────────────────
 class _JsonFmt(logging.Formatter):
     def format(self, r):
         d = {"ts": self.formatTime(r, "%Y-%m-%dT%H:%M:%S"), "level": r.levelname, "msg": r.getMessage()}
@@ -304,8 +300,7 @@ _INJECTION_PATTERNS = [
     r"forget\s+(everything|all|your\s+instructions?|what\s+i\s+said)",
     r"override\s+(previous|all|your)\s*(instructions?|rules?|prompt)?",
     r"(act|behave|pretend|roleplay|respond|answer)\s+(as|like|you\s+are|you.re)",
-    r"you\s+are\s+now\s+(a|an|the)",
-    r"you\s+are\s+now",
+    r"you\s+are\s+now\s+(a|an|the)", r"you\s+are\s+now",
     r"from\s+now\s+on\s+(you|act|be|respond)",
     r"your\s+new\s+(role|persona|identity|name|instructions?)",
     r"switch\s+(role|mode|persona|identity)",
@@ -536,39 +531,40 @@ def _increment_daily_sessions(phone):
 # ─────────────────────────────────────────────
 # תרגיל נשימה — background
 #
-# v50: הוסר breathing_post_round_wait (גרם לעיכוב 120s לפני סבב חדש)
+# v51: run_breathing_round מקבל forced_round_id
+#   — נמנע race condition: ה-thread החדש לא צריך לחכות ל-get_state
+#   — round_id מחושב ב-_handle_message_inner ומועבר ישירות
 #
-# הלוגיקה החדשה:
-#   1. run_breathing_round מריץ 3 סבבים ושולח "סיימנו... נמשיך? (כן/לא)"
-#   2. בסיום: waiting_confirm=True + מפעיל breathing_timeout_nudge (60s)
-#   3. כן → _handle_message_inner: round_id+1 → _enqueue(run_breathing_round) מיד
-#   4. לא / timeout → MSG_BREATHING_STOP + tool=none
+# זרימה:
+#   כן  → new_round = round_id+1 → set_state → _enqueue(run_breathing_round, phone, new_round)
+#   לא  → set_state(tool=none)   → MSG_BREATHING_STOP
+#   60s  → breathing_timeout_nudge → MSG_BREATHING_STOP
 # ─────────────────────────────────────────────
 
 def breathing_timeout_nudge(phone, my_round_id):
     """
-    v50: ממתין 60s אחרי "נמשיך?".
+    ממתין 60s אחרי "נמשיך?".
     אם המשתמש לא ענה → יוצא עם MSG_BREATHING_STOP.
-    אם המשתמש ענה (round_id שונה או tool שונה) → יוצא בשקט.
+    אם המשתמש ענה (round_id שונה) → יוצא בשקט.
     """
     time.sleep(60)
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        # המשתמש ענה כן/לא בינתיים — לא עושים כלום
         return
-    # לא ענה תוך 60s — מתייחסים כ"לא"
     log.info("breathing_timeout_exit", extra={"phone": phone})
     set_state(phone, tool="none", step=0, round_id=my_round_id + 1, waiting_confirm=False)
     send_message(phone, MSG_BREATHING_STOP)
 
-def run_breathing_round(phone):
+def run_breathing_round(phone, forced_round_id=None):
     """
-    v50: מריץ סבב נשימה שלם (13 הודעות, 5s ביניהן).
-    בסיום: waiting_confirm=True + מפעיל breathing_timeout_nudge(60s).
-    כשמשתמש עונה "כן" — _handle_message_inner מפעיל run_breathing_round מחדש מיד.
+    v51: מקבל forced_round_id ישירות מ-_handle_message_inner.
+    — מונע race condition: לא תלוי ב-get_state לקבלת round_id.
+    — אם forced_round_id=None (קריאה ראשונה מ-"א") — קורא get_state.
     """
     s = get_state(phone)
-    my_round_id = s["round_id"]
+
+    # v51: שימוש ב-forced_round_id אם הועבר, אחרת מ-state
+    my_round_id = forced_round_id if forced_round_id is not None else s["round_id"]
 
     if s["tool"] != "breathing":
         return
@@ -582,13 +578,12 @@ def run_breathing_round(phone):
         if i < len(BREATHING_PARTS) - 1:
             time.sleep(5)
 
-    # בדיקה אחרונה לפני waiting_confirm
+    # בדיקה אחרונה
     s = get_state(phone)
     if s["tool"] != "breathing" or s["round_id"] != my_round_id:
         return
 
-    # מציב waiting_confirm=True ומפעיל timeout של 60s
-    # last_msg_time=0.0 מאפס debounce — תגובת כן/לא מתקבלת מיד
+    # סיום סבב — ממתין לכן/לא עם timeout של 60s
     set_state(phone, last_msg_time=0.0, waiting_confirm=True)
     _enqueue(breathing_timeout_nudge, phone, my_round_id)
 
@@ -649,7 +644,7 @@ def _handle_message_inner(phone, text):
     text = _clean_text(text)
     t    = text.lower()
 
-    # 1. משבר — עדיפות עליונה
+    # 1. משבר
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
         set_state(phone, tool="none", step=0, wait_count=0, sad_count=0)
@@ -667,14 +662,13 @@ def _handle_message_inner(phone, text):
     if now - s["last_msg_time"] < DEBOUNCE_SEC:
         return
 
-    # 4. injection guard
+    # 4. injection
     if guardian_check_input(text):
         log.warning("injection_attempt", extra={"phone": phone, "text": text[:80]})
         set_state(phone, tool="none", step=0)
         send_message(phone, MSG_OFF_TOPIC)
         return
 
-    # עדכון last_msg_time
     s["last_msg_time"] = now
     try:
         _redis.set(STATE_KEY_PREFIX + phone, json.dumps(s), ex=STATE_TTL_SEC)
@@ -706,21 +700,21 @@ def _handle_message_inner(phone, text):
     # 7. נשימה פעילה
     if tool == "breathing":
 
-        # לא — עוצר
+        # לא → עצור
         if t in BREATHING_STOP_WORDS:
             set_state(phone, tool="none", step=0,
                       round_id=s["round_id"] + 1, waiting_confirm=False)
             send_message(phone, MSG_BREATHING_STOP)
             return
 
-        # כן — מתחיל סבב חדש מיד (v50: ללא המתנה!)
+        # כן → סבב חדש מיד עם forced_round_id (v51: ללא race condition)
         if t in BREATHING_YES_WORDS:
             new_round = s["round_id"] + 1
             set_state(phone, round_id=new_round, waiting_confirm=False)
-            _enqueue(run_breathing_round, phone)   # ← מתחיל מיד
+            _enqueue(run_breathing_round, phone, new_round)  # ← v51: מועבר ישירות
             return
 
-        # כל דבר אחר — תזכורת
+        # אחר → תזכורת
         send_message(phone, MSG_BREATHING_WAIT_CONFIRM)
         return
 
@@ -747,14 +741,15 @@ def _handle_message_inner(phone, text):
 
     # 9. בחירת נשימה
     if text == "א" or t == "a":
-        daily = _increment_daily_sessions(phone)
-        set_state(phone, tool="breathing", step=0, round_id=s["round_id"] + 1)
+        daily     = _increment_daily_sessions(phone)
+        new_round = s["round_id"] + 1
+        set_state(phone, tool="breathing", step=0, round_id=new_round)
         if daily >= DAILY_SESSION_THRESHOLD:
             log.info("professional_referral", extra={"phone": phone, "daily_sessions": daily})
             send_message(phone, MSG_PROFESSIONAL_REFERRAL)
         else:
             send_message(phone, BREATHING_START)
-        _enqueue(run_breathing_round, phone)
+        _enqueue(run_breathing_round, phone, new_round)  # ← forced_round_id
         return
 
     # 10. בחירת קרקוע
@@ -944,7 +939,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v50",
+        "version": "v51",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -952,7 +947,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v50", 200
+    return "SafeHarbor Bot is running v51", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
