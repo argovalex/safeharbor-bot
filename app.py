@@ -1,8 +1,9 @@
-# SafeHarbor Bot v55
-# תיקונים מ-v54:
-#   1. BREATHING_START נשלח בתחילת כל לולאה (גם אחרי "כן")
-#   2. _br_wait_fast: polling כל 0.1s — thread מתעורר מיד אחרי "yes"
-#   3. run_breathing: לוגיקה נקייה לפי התרשים בדיוק
+# SafeHarbor Bot v56
+# שינויים מ-v55:
+#   1. הוסר MSG_PROFESSIONAL_REFERRAL לחלוטין
+#   2. הוסר DAILY_SESSION_THRESHOLD, _increment_daily_sessions, daily_sessions, last_session_date
+#   3. בחירת נשימה: set_state + _enqueue(run_breathing) בלבד
+#   4. בחירת קרקוע: set_state(step=0) + send GROUNDING_STEPS[0] בלבד — תיקון ה-step 4 bug
 
 import os, time, json, logging, threading
 import requests as http_requests
@@ -152,19 +153,6 @@ MSG_BREATHING_STOP = (
 MSG_BREATHING_WAIT_CONFIRM = "הקש *כן* להמשך סבב נוסף, או *לא* לעצור. \U0001f32c\ufe0f"
 MSG_RESET                  = "בסדר, אני כאן כשתצטרך. \U0001f30a"
 BREATHING_START            = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
-
-MSG_PROFESSIONAL_REFERRAL = (
-    'אני שמחה שאתה כאן. \U0001f499\n'
-    'אני מרגישה שמגיעה לך גם תמיכה אנושית אמיתית.\n\n'
-    'כדאי לשוחח עם מישהו שיכול לעזור לך לעומק:\n'
-    '\u260e\ufe0f ער"ן: 1201\n'
-    '\U0001f4ac https://wa.me/972528451201\n'
-    '\U0001f4ac סה"ר: https://wa.me/972543225656\n'
-    '\u260e\ufe0f נט"ל: 1-800-363-363\n\n'
-    '*מה יעזור לך יותר ברגע הזה?*\n'
-    '\U0001f32c\ufe0f הקש *א* — נשימה\n'
-    '\u2693 הקש *ב* — קרקוע'
-)
 
 # ─────────────────────────────────────────────
 # תרגיל נשימה — 3 מחזורי box breathing
@@ -345,7 +333,7 @@ def _build_allowed_outgoing():
     for msg in [MSG_WELCOME, MSG_RETURNING, MSG_NUDGE, MSG_WELCOME_NUDGE,
                 MSG_CRISIS, MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET,
                 BREATHING_START, GROUNDING_NUDGE_1, GROUNDING_NUDGE_2,
-                MSG_PROFESSIONAL_REFERRAL, MSG_BREATHING_WAIT_CONFIRM]:
+                MSG_BREATHING_WAIT_CONFIRM]:
         _ALLOWED_OUTGOING.add(msg.strip())
     for msg in BREATHING_PARTS + GROUNDING_STEPS:
         _ALLOWED_OUTGOING.add(msg.strip())
@@ -485,15 +473,8 @@ _STATE_DEFAULTS = {
     "wait_count":        0,
     "grounding_session": 0,
     "sad_count":         0,
-    "daily_sessions":    0,
-    "last_session_date": "",
-    # breathing_active:
-    #   True  = מחזורים רצים (התעלם מהודעות נכנסות)
-    #   False = ממתין לכן/לא אחרי "נמשיך?"
     "breathing_active":  False,
 }
-
-DAILY_SESSION_THRESHOLD = 5
 
 def _default_state():
     return dict(_STATE_DEFAULTS)
@@ -528,20 +509,8 @@ def _is_duplicate_msg(msg_id):
         log.error("dedup_error", extra={"err": str(e)})
         return False
 
-def _increment_daily_sessions(phone):
-    today = time.strftime("%Y-%m-%d")
-    s = get_state(phone)
-    if s.get("last_session_date") != today:
-        set_state(phone, daily_sessions=1, last_session_date=today)
-        return 1
-    new_count = s.get("daily_sessions", 0) + 1
-    set_state(phone, daily_sessions=new_count)
-    return new_count
-
 # ─────────────────────────────────────────────
-# Redis reply channel — תקשורת handler ↔ run_breathing
-#
-# handler כותב "yes" או "no" → run_breathing קורא
+# Redis reply channel
 # ─────────────────────────────────────────────
 _BR_TTL = 120
 
@@ -561,13 +530,7 @@ def _br_write(phone, value):
         log.error("br_write_error", extra={"phone": phone, "err": str(e)})
 
 def _br_wait_fast(phone, timeout=60):
-    """
-    v55: polling כל 0.1s — מתעורר כמעט מיד אחרי _br_write.
-    בכל iteration בודק:
-      1. tool עדיין "breathing"? אחרת → "abort"
-      2. יש key בRedis? → מחזיר "yes"/"no"
-    timeout → "timeout"
-    """
+    """polling כל 0.1s — תגובה כמעט מיידית"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         s = get_state(phone)
@@ -580,64 +543,56 @@ def _br_wait_fast(phone, timeout=60):
         if val in ("yes", "no"):
             _br_clear(phone)
             return val
-        time.sleep(0.1)   # v55: 0.1s במקום 0.5s — תגובה כמעט מיידית
+        time.sleep(0.1)
     return "timeout"
 
 # ─────────────────────────────────────────────
-# run_breathing — thread יחיד, לולאה לפי התרשים
+# run_breathing — thread יחיד
 #
-# v55: BREATHING_START נשלח בתחילת כל iteration (גם אחרי "כן")
-#
-# זרימה מדויקת:
-#   loop:
-#     1. set breathing_active=True
-#     2. שלח BREATHING_START
-#     3. שלח 12 הודעות + "נמשיך?" (5s בין הודעות)
-#     4. set breathing_active=False
-#     5. נקה key + המתן _br_wait_fast(60s)
-#     6. yes  → continue (מיד לתחילת loop)
-#     7. no / timeout / abort → MSG_BREATHING_STOP → return
+# כל iteration:
+#   1. breathing_active=True
+#   2. BREATHING_START
+#   3. 12 הודעות + "נמשיך?"
+#   4. breathing_active=False
+#   5. המתן _br_wait_fast(60s)
+#   6. yes → continue מיד | no/timeout/abort → עצור
 # ─────────────────────────────────────────────
 def run_breathing(phone):
     log.info("breathing_start", extra={"phone": phone})
 
     while True:
-        # בדיקת tool בתחילת כל iteration
         s = get_state(phone)
         if s.get("tool") != "breathing":
-            log.info("breathing_exit_tool_changed", extra={"phone": phone})
+            log.info("breathing_exit", extra={"phone": phone})
             return
 
-        # ── שלב א: סמן שמחזורים רצים ──
         set_state(phone, breathing_active=True)
-        _br_clear(phone)  # נקה תשובות ישנות
+        _br_clear(phone)
 
-        # ── שלב ב: שלח "בוא נספור" — בכל iteration (גם אחרי כן!) ──
+        # שלח "בוא נספור" — בכל iteration (גם אחרי "כן")
         send_message(phone, BREATHING_START)
 
-        # ── שלב ג: 12 הודעות + "נמשיך?" ──
+        # 12 הודעות + "נמשיך?"
         for i, part in enumerate(BREATHING_PARTS):
             s = get_state(phone)
             if s.get("tool") != "breathing":
-                log.info("breathing_aborted_mid_round", extra={"phone": phone, "step": i})
+                log.info("breathing_aborted", extra={"phone": phone, "step": i})
                 return
             send_message(phone, part)
             if i < len(BREATHING_PARTS) - 1:
                 time.sleep(5)
 
-        # ── שלב ד: סמן ממתין לתשובה ──
+        # ממתין לתשובה
         set_state(phone, breathing_active=False)
-        _br_clear(phone)  # נקה שוב — מונע תשובה שנכתבה בזמן המחזורים
+        _br_clear(phone)
 
-        log.info("breathing_waiting_reply", extra={"phone": phone})
         reply = _br_wait_fast(phone, timeout=60)
-        log.info("breathing_got_reply", extra={"phone": phone, "reply": reply})
+        log.info("breathing_reply", extra={"phone": phone, "reply": reply})
 
         if reply == "yes":
-            # ── כן → לולאה חוזרת מיד ← BREATHING_START ישלח שוב בתחילת iteration ──
-            continue
+            continue  # מיד לתחילת iteration — BREATHING_START ישלח שוב
 
-        # ── לא / timeout / abort → עצור ──
+        # לא / timeout / abort
         s = get_state(phone)
         if s.get("tool") == "breathing":
             set_state(phone, tool="none", step=0, breathing_active=False)
@@ -702,10 +657,10 @@ def _handle_message_inner(phone, text):
     text = _clean_text(text)
     t    = text.lower()
 
-    # 1. משבר — עדיפות עליונה
+    # 1. משבר
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
-        set_state(phone, tool="none", step=0, wait_count=0, sad_count=0, breathing_active=False)
+        set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
         _br_clear(phone)
         send_message(phone, MSG_CRISIS)
         return
@@ -760,28 +715,21 @@ def _handle_message_inner(phone, text):
 
     # ── 7. נשימה פעילה ──
     if tool == "breathing":
-
-        # עצור — תמיד עובד בכל מצב
         if t in BREATHING_STOP_WORDS:
             set_state(phone, tool="none", step=0, breathing_active=False)
-            _br_write(phone, "no")   # מעיר את _br_wait_fast אם ממתין
+            _br_write(phone, "no")
             send_message(phone, MSG_BREATHING_STOP)
             return
-
-        # breathing_active=False → ממתין לכן/לא
         if not s.get("breathing_active"):
             if t in BREATHING_YES_WORDS:
-                # כן → thread יקרא "yes" תוך 0.1s ויתחיל מיד
                 _br_write(phone, "yes")
                 return
             else:
                 send_message(phone, MSG_BREATHING_WAIT_CONFIRM)
                 return
+        return  # breathing_active=True → התעלם
 
-        # breathing_active=True → מחזורים רצים, התעלם
-        return
-
-    # 8. קרקוע פעיל
+    # ── 8. קרקוע פעיל ──
     if tool == "grounding":
         gs = s["grounding_session"]
         if t in GROUNDING_RESET_WORDS:
@@ -802,26 +750,17 @@ def _handle_message_inner(phone, text):
             send_message(phone, MSG_RETURNING)
         return
 
-    # 9. בחירת נשימה
+    # ── 9. בחירת נשימה ──
     if text == "א" or t == "a":
-        daily = _increment_daily_sessions(phone)
         set_state(phone, tool="breathing", step=0, breathing_active=False)
-        if daily >= DAILY_SESSION_THRESHOLD:
-            log.info("professional_referral", extra={"phone": phone, "daily_sessions": daily})
-            send_message(phone, MSG_PROFESSIONAL_REFERRAL)
         _enqueue(run_breathing, phone)
         return
 
-    # 10. בחירת קרקוע
+    # ── 10. בחירת קרקוע ──
     if text == "ב" or t == "b":
-        daily  = _increment_daily_sessions(phone)
         new_gs = s["grounding_session"] + 1
         set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs)
-        if daily >= DAILY_SESSION_THRESHOLD:
-            log.info("professional_referral", extra={"phone": phone, "daily_sessions": daily})
-            send_message(phone, MSG_PROFESSIONAL_REFERRAL)
-        else:
-            send_message(phone, GROUNDING_STEPS[0])
+        send_message(phone, GROUNDING_STEPS[0])
         _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
 
@@ -999,7 +938,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v55",
+        "version": "v56",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -1007,7 +946,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v55", 200
+    return "SafeHarbor Bot is running v56", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
