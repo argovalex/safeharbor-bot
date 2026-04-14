@@ -1,11 +1,8 @@
-# SafeHarbor Bot v52
-# תיקון v52: טיפול מפורש ב-waiting_confirm בתרגיל הנשימה
-#   — כשהבוט שלח "נמשיך? (כן/לא)" ו-waiting_confirm=True:
-#     כן  → set_state מיד + _enqueue(run_breathing_round, phone, new_round)
-#     לא  → MSG_BREATHING_STOP
-#     אחר → MSG_BREATHING_WAIT_CONFIRM
-#   — הוספת מילים ל-BREATHING_YES_WORDS
-#   — סדר בדיקות מסודר: עצור → waiting_confirm → off-topic
+# SafeHarbor Bot v55
+# תיקונים מ-v54:
+#   1. BREATHING_START נשלח בתחילת כל לולאה (גם אחרי "כן")
+#   2. _br_wait_fast: polling כל 0.1s — thread מתעורר מיד אחרי "yes"
+#   3. run_breathing: לוגיקה נקייה לפי התרשים בדיוק
 
 import os, time, json, logging, threading
 import requests as http_requests
@@ -153,9 +150,8 @@ MSG_BREATHING_STOP = (
 )
 
 MSG_BREATHING_WAIT_CONFIRM = "הקש *כן* להמשך סבב נוסף, או *לא* לעצור. \U0001f32c\ufe0f"
-
-MSG_RESET       = "בסדר, אני כאן כשתצטרך. \U0001f30a"
-BREATHING_START = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
+MSG_RESET                  = "בסדר, אני כאן כשתצטרך. \U0001f30a"
+BREATHING_START            = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 MSG_PROFESSIONAL_REFERRAL = (
     'אני שמחה שאתה כאן. \U0001f499\n'
@@ -171,7 +167,7 @@ MSG_PROFESSIONAL_REFERRAL = (
 )
 
 # ─────────────────────────────────────────────
-# תרגיל נשימה
+# תרגיל נשימה — 3 מחזורי box breathing
 # ─────────────────────────────────────────────
 BREATHING_PARTS = [
     "\u2B05\ufe0f שאיפה איטית... 21-22-23-24-25",
@@ -208,16 +204,13 @@ GROUNDING_HINTS      = ["רואה", "יכול לגעת בהם", "שומע", "מ�
 
 # ─────────────────────────────────────────────
 # מילות מפתח
-# v52: הורחב BREATHING_YES_WORDS
 # ─────────────────────────────────────────────
 BREATHING_YES_WORDS = {
-    # עברית
     "כן", "כ", "כן כן", "בטח", "אוקיי", "אוקי", "טוב", "סבבה", "נו",
-    "המשך", "עוד", "עוד סבב", "נמשיך", "קדימה", "יאללה", "אחד עוד",
-    "רוצה עוד", "רוצה להמשיך", "בוא נמשיך", "כן בבקשה",
-    # אנגלית
+    "המשך", "עוד", "עוד סבב", "נמשיך", "קדימה", "יאללה",
+    "רוצה עוד", "כן בבקשה",
     "yes", "y", "sure", "ok", "okay", "yep", "yeah", "yup",
-    "continue", "more", "go", "go on", "let's go", "again",
+    "continue", "more", "go", "again",
 }
 BREATHING_STOP_WORDS  = {"לא", "ל", "no", "n", "די", "stop", "done", "סיום", "עצור"}
 GREET_WORDS           = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
@@ -485,10 +478,19 @@ SEEN_MSG_TTL_SEC = 120
 STATE_TTL_SEC    = 90 * 24 * 3600
 
 _STATE_DEFAULTS = {
-    "tool": "none", "step": 0, "welcomed": False, "round_id": 0,
-    "last_msg_time": 0.0, "wait_count": 0, "grounding_session": 0,
-    "sad_count": 0, "daily_sessions": 0, "last_session_date": "",
-    "waiting_confirm": False,
+    "tool":              "none",
+    "step":              0,
+    "welcomed":          False,
+    "last_msg_time":     0.0,
+    "wait_count":        0,
+    "grounding_session": 0,
+    "sad_count":         0,
+    "daily_sessions":    0,
+    "last_session_date": "",
+    # breathing_active:
+    #   True  = מחזורים רצים (התעלם מהודעות נכנסות)
+    #   False = ממתין לכן/לא אחרי "נמשיך?"
+    "breathing_active":  False,
 }
 
 DAILY_SESSION_THRESHOLD = 5
@@ -537,51 +539,111 @@ def _increment_daily_sessions(phone):
     return new_count
 
 # ─────────────────────────────────────────────
-# תרגיל נשימה — background
+# Redis reply channel — תקשורת handler ↔ run_breathing
+#
+# handler כותב "yes" או "no" → run_breathing קורא
 # ─────────────────────────────────────────────
+_BR_TTL = 120
 
-def breathing_timeout_nudge(phone, my_round_id):
-    """
-    ממתין 60s אחרי "נמשיך?".
-    אם המשתמש לא ענה → יוצא עם MSG_BREATHING_STOP.
-    אם המשתמש ענה (round_id שונה) → יוצא בשקט.
-    """
-    time.sleep(60)
-    s = get_state(phone)
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-        return
-    log.info("breathing_timeout_exit", extra={"phone": phone})
-    set_state(phone, tool="none", step=0, round_id=my_round_id + 1, waiting_confirm=False)
-    send_message(phone, MSG_BREATHING_STOP)
+def _br_key(phone):
+    return "sh:br:{}".format(phone)
 
-def run_breathing_round(phone, forced_round_id=None):
-    """
-    מריץ סבב נשימה שלם (13 הודעות, 5s ביניהן).
-    v51+: מקבל forced_round_id ישירות — מונע race condition.
-    בסיום: waiting_confirm=True + timeout 60s.
-    """
-    s = get_state(phone)
-    my_round_id = forced_round_id if forced_round_id is not None else s["round_id"]
+def _br_clear(phone):
+    try:
+        _redis.delete(_br_key(phone))
+    except Exception:
+        pass
 
-    if s["tool"] != "breathing":
-        return
+def _br_write(phone, value):
+    try:
+        _redis.set(_br_key(phone), value, ex=_BR_TTL)
+    except Exception as e:
+        log.error("br_write_error", extra={"phone": phone, "err": str(e)})
 
-    for i, part in enumerate(BREATHING_PARTS):
+def _br_wait_fast(phone, timeout=60):
+    """
+    v55: polling כל 0.1s — מתעורר כמעט מיד אחרי _br_write.
+    בכל iteration בודק:
+      1. tool עדיין "breathing"? אחרת → "abort"
+      2. יש key בRedis? → מחזיר "yes"/"no"
+    timeout → "timeout"
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         s = get_state(phone)
-        if s["tool"] != "breathing" or s["round_id"] != my_round_id:
-            log.info("breathing_aborted", extra={"phone": phone, "step": i})
+        if s.get("tool") != "breathing":
+            return "abort"
+        try:
+            val = _redis.get(_br_key(phone))
+        except Exception:
+            val = None
+        if val in ("yes", "no"):
+            _br_clear(phone)
+            return val
+        time.sleep(0.1)   # v55: 0.1s במקום 0.5s — תגובה כמעט מיידית
+    return "timeout"
+
+# ─────────────────────────────────────────────
+# run_breathing — thread יחיד, לולאה לפי התרשים
+#
+# v55: BREATHING_START נשלח בתחילת כל iteration (גם אחרי "כן")
+#
+# זרימה מדויקת:
+#   loop:
+#     1. set breathing_active=True
+#     2. שלח BREATHING_START
+#     3. שלח 12 הודעות + "נמשיך?" (5s בין הודעות)
+#     4. set breathing_active=False
+#     5. נקה key + המתן _br_wait_fast(60s)
+#     6. yes  → continue (מיד לתחילת loop)
+#     7. no / timeout / abort → MSG_BREATHING_STOP → return
+# ─────────────────────────────────────────────
+def run_breathing(phone):
+    log.info("breathing_start", extra={"phone": phone})
+
+    while True:
+        # בדיקת tool בתחילת כל iteration
+        s = get_state(phone)
+        if s.get("tool") != "breathing":
+            log.info("breathing_exit_tool_changed", extra={"phone": phone})
             return
-        send_message(phone, part)
-        if i < len(BREATHING_PARTS) - 1:
-            time.sleep(5)
 
-    s = get_state(phone)
-    if s["tool"] != "breathing" or s["round_id"] != my_round_id:
+        # ── שלב א: סמן שמחזורים רצים ──
+        set_state(phone, breathing_active=True)
+        _br_clear(phone)  # נקה תשובות ישנות
+
+        # ── שלב ב: שלח "בוא נספור" — בכל iteration (גם אחרי כן!) ──
+        send_message(phone, BREATHING_START)
+
+        # ── שלב ג: 12 הודעות + "נמשיך?" ──
+        for i, part in enumerate(BREATHING_PARTS):
+            s = get_state(phone)
+            if s.get("tool") != "breathing":
+                log.info("breathing_aborted_mid_round", extra={"phone": phone, "step": i})
+                return
+            send_message(phone, part)
+            if i < len(BREATHING_PARTS) - 1:
+                time.sleep(5)
+
+        # ── שלב ד: סמן ממתין לתשובה ──
+        set_state(phone, breathing_active=False)
+        _br_clear(phone)  # נקה שוב — מונע תשובה שנכתבה בזמן המחזורים
+
+        log.info("breathing_waiting_reply", extra={"phone": phone})
+        reply = _br_wait_fast(phone, timeout=60)
+        log.info("breathing_got_reply", extra={"phone": phone, "reply": reply})
+
+        if reply == "yes":
+            # ── כן → לולאה חוזרת מיד ← BREATHING_START ישלח שוב בתחילת iteration ──
+            continue
+
+        # ── לא / timeout / abort → עצור ──
+        s = get_state(phone)
+        if s.get("tool") == "breathing":
+            set_state(phone, tool="none", step=0, breathing_active=False)
+            send_message(phone, MSG_BREATHING_STOP)
+        _br_clear(phone)
         return
-
-    # סיום סבב — ממתין לכן/לא
-    set_state(phone, last_msg_time=0.0, waiting_confirm=True)
-    _enqueue(breathing_timeout_nudge, phone, my_round_id)
 
 # ─────────────────────────────────────────────
 # קרקוע — nudges
@@ -640,10 +702,11 @@ def _handle_message_inner(phone, text):
     text = _clean_text(text)
     t    = text.lower()
 
-    # 1. משבר
+    # 1. משבר — עדיפות עליונה
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
-        set_state(phone, tool="none", step=0, wait_count=0, sad_count=0)
+        set_state(phone, tool="none", step=0, wait_count=0, sad_count=0, breathing_active=False)
+        _br_clear(phone)
         send_message(phone, MSG_CRISIS)
         return
 
@@ -661,7 +724,8 @@ def _handle_message_inner(phone, text):
     # 4. injection
     if guardian_check_input(text):
         log.warning("injection_attempt", extra={"phone": phone, "text": text[:80]})
-        set_state(phone, tool="none", step=0)
+        set_state(phone, tool="none", step=0, breathing_active=False)
+        _br_clear(phone)
         send_message(phone, MSG_OFF_TOPIC)
         return
 
@@ -680,7 +744,8 @@ def _handle_message_inner(phone, text):
         set_state(phone, sad_count=new_sad)
         if new_sad >= 3:
             log.info("escalation_crisis", extra={"phone": phone, "sad_count": new_sad})
-            set_state(phone, tool="none", step=0, sad_count=0)
+            set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
+            _br_clear(phone)
             send_message(phone, MSG_CRISIS)
             return
     else:
@@ -694,35 +759,26 @@ def _handle_message_inner(phone, text):
         return
 
     # ── 7. נשימה פעילה ──
-    # v52: סדר בדיקות מחדש + טיפול מפורש ב-waiting_confirm
     if tool == "breathing":
 
-        # א. עצור תמיד — גם באמצע סבב וגם אחרי "נמשיך?"
+        # עצור — תמיד עובד בכל מצב
         if t in BREATHING_STOP_WORDS:
-            set_state(phone, tool="none", step=0,
-                      round_id=s["round_id"] + 1, waiting_confirm=False)
+            set_state(phone, tool="none", step=0, breathing_active=False)
+            _br_write(phone, "no")   # מעיר את _br_wait_fast אם ממתין
             send_message(phone, MSG_BREATHING_STOP)
             return
 
-        # ב. waiting_confirm=True — הבוט שאל "נמשיך? (כן/לא)"
-        if s.get("waiting_confirm"):
+        # breathing_active=False → ממתין לכן/לא
+        if not s.get("breathing_active"):
             if t in BREATHING_YES_WORDS:
-                # v52: כן → סבב חדש מיד, זהה להתנהגות "א"
-                new_round = s["round_id"] + 1
-                set_state(phone, round_id=new_round, waiting_confirm=False)
-                send_message(phone, BREATHING_START)
-                _enqueue(run_breathing_round, phone, new_round)
-                log.info("breathing_continue", extra={"phone": phone, "round": new_round})
+                # כן → thread יקרא "yes" תוך 0.1s ויתחיל מיד
+                _br_write(phone, "yes")
                 return
             else:
-                # לא "כן" ולא "לא" — תזכורת
                 send_message(phone, MSG_BREATHING_WAIT_CONFIRM)
                 return
 
-        # ג. סבב רץ כרגע — כל הודעה נחשבת כ"לא" (המשתמש רוצה לעצור)
-        set_state(phone, tool="none", step=0,
-                  round_id=s["round_id"] + 1, waiting_confirm=False)
-        send_message(phone, MSG_BREATHING_STOP)
+        # breathing_active=True → מחזורים רצים, התעלם
         return
 
     # 8. קרקוע פעיל
@@ -748,15 +804,12 @@ def _handle_message_inner(phone, text):
 
     # 9. בחירת נשימה
     if text == "א" or t == "a":
-        daily     = _increment_daily_sessions(phone)
-        new_round = s["round_id"] + 1
-        set_state(phone, tool="breathing", step=0, round_id=new_round, waiting_confirm=False)
+        daily = _increment_daily_sessions(phone)
+        set_state(phone, tool="breathing", step=0, breathing_active=False)
         if daily >= DAILY_SESSION_THRESHOLD:
             log.info("professional_referral", extra={"phone": phone, "daily_sessions": daily})
             send_message(phone, MSG_PROFESSIONAL_REFERRAL)
-        else:
-            send_message(phone, BREATHING_START)
-        _enqueue(run_breathing_round, phone, new_round)
+        _enqueue(run_breathing, phone)
         return
 
     # 10. בחירת קרקוע
@@ -946,7 +999,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v52",
+        "version": "v55",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -954,7 +1007,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v52", 200
+    return "SafeHarbor Bot is running v55", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
