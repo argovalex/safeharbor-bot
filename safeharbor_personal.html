@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SafeHarbor – מנוי אישי</title>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Heebo', sans-serif; background: #f0f9f6; color: #1a1a1a; direction: rtl; min-height: 100vh; }
+
+.top-bar {
+  background: #0f2642; padding: 14px 32px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.top-logo { font-size: 16px; font-weight: 700; color: #fff; letter-spacing: -0.01em; }
+.top-note { font-size: 12px; color: rgba(255,255,255,0.45); }
+
+/* HERO */
+.hero { text-align: center; padding: 52px 24px 36px; }
+.hero-icon { font-size: 48px; margin-bottom: 16px; }
+.hero h1 { font-size: 28px; font-weight: 700; color: #0f2642; margin-bottom: 10px; line-height: 1.3; }
+.hero p { font-size: 15px; color: #5a6a75; line-height: 1.75; max-width: 480px; margin: 0 auto; }
+
+/* FEATURES STRIP */
+.features {
+  display: flex; justify-content: center; gap: 0;
+  background: #fff; border-top: 1px solid #e0ede9;
+  border-bottom: 1px solid #e0ede9; margin: 28px 0;
+  flex-wrap: wrap;
+}
+.feat {
+  padding: 18px 28px; text-align: center; font-size: 13px;
+  color: #5a6a75; border-left: 1px solid #e0ede9; flex: 1; min-width: 140px;
+}
+.feat:last-child { border: none; }
+.feat strong { display: block; color: #0f2642; font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+
+/* PLAN CARD */
+.plan-wrap { max-width: 400px; margin: 0 auto 32px; padding: 0 20px; }
+.plan-card {
+  background: #fff; border: 2px solid #0e6e5c;
+  border-radius: 20px; padding: 32px; text-align: center;
+  position: relative;
+}
+.plan-badge {
+  position: absolute; top: -14px; right: 50%; transform: translateX(50%);
+  background: #0e6e5c; color: #fff; font-size: 12px; font-weight: 700;
+  padding: 4px 16px; border-radius: 100px;
+}
+.plan-name { font-size: 13px; color: #5a6a75; font-weight: 600; margin-bottom: 10px; }
+.plan-price {
+  display: flex; align-items: baseline; justify-content: center;
+  gap: 4px; margin-bottom: 4px;
+}
+.plan-price .currency { font-size: 20px; font-weight: 600; color: #0f2642; }
+.plan-price .amount { font-size: 52px; font-weight: 700; color: #0f2642; line-height: 1; }
+.plan-price .period { font-size: 14px; color: #5a6a75; }
+.plan-trial {
+  font-size: 13px; color: #0e6e5c; font-weight: 600; margin-bottom: 20px;
+}
+.plan-features { list-style: none; text-align: right; margin-bottom: 0; }
+.plan-features li {
+  font-size: 14px; color: #1a1a1a; padding: 8px 0;
+  border-bottom: 1px solid #f0f5f3;
+  display: flex; align-items: center; gap: 8px;
+}
+.plan-features li:last-child { border: none; }
+.chk { color: #0e6e5c; font-weight: 700; font-size: 15px; }
+
+/* FORM */
+.payment-form {
+  background: #fff; border: 1px solid #e0ede9;
+  border-radius: 16px; padding: 32px;
+  max-width: 460px; margin: 0 auto 40px;
+}
+.form-title { font-size: 17px; font-weight: 700; color: #0f2642; margin-bottom: 4px; }
+.form-subtitle { font-size: 13px; color: #5a6a75; margin-bottom: 24px; }
+
+.field { margin-bottom: 15px; }
+.field label {
+  display: block; font-size: 12px; font-weight: 600;
+  color: #5a6a75; margin-bottom: 5px;
+}
+.field input {
+  width: 100%; padding: 11px 14px;
+  border: 1px solid #d0ddd9; border-radius: 8px;
+  font-size: 14px; font-family: 'Heebo', sans-serif;
+  color: #1a1a1a; background: #fff; outline: none;
+}
+.field input:focus { border-color: #0e6e5c; box-shadow: 0 0 0 3px rgba(14,110,92,0.08); }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.card-row  { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+
+.tranzila-note {
+  background: #f0f9f6; border-radius: 8px; padding: 10px 14px;
+  font-size: 12px; color: #5a6a75; margin-bottom: 18px;
+  display: flex; align-items: center; gap: 8px; line-height: 1.5;
+}
+
+.summary-box {
+  background: #f7faf9; border: 1px solid #e0ede9;
+  border-radius: 10px; padding: 14px 16px; margin-bottom: 18px;
+}
+.summary-row {
+  display: flex; justify-content: space-between;
+  font-size: 13px; color: #1a1a1a; padding: 4px 0;
+}
+.summary-row .muted { color: #8a9aa5; }
+.summary-row.total {
+  font-weight: 700; font-size: 15px;
+  border-top: 1px solid #e0ede9; margin-top: 8px; padding-top: 10px;
+}
+
+.trial-reminder {
+  background: #e1f5ee; border-radius: 8px; padding: 10px 14px;
+  font-size: 13px; color: #0e6e5c; font-weight: 500;
+  margin-bottom: 18px; text-align: center;
+}
+
+.submit-btn {
+  width: 100%; background: #0e6e5c; color: #fff;
+  padding: 14px; border-radius: 8px; border: none;
+  font-size: 16px; font-weight: 700; font-family: 'Heebo', sans-serif;
+  cursor: pointer; transition: background 0.2s;
+}
+.submit-btn:hover { background: #0a5a4a; }
+.submit-btn:disabled { background: #b0c9c4; cursor: not-allowed; }
+
+.form-footer {
+  text-align: center; font-size: 11px; color: #8a9aa5; margin-top: 12px; line-height: 1.6;
+}
+
+/* SUCCESS */
+.success-screen {
+  display: none; text-align: center; padding: 72px 24px;
+  max-width: 420px; margin: 0 auto;
+}
+.success-icon { font-size: 60px; margin-bottom: 18px; }
+.success-title { font-size: 26px; font-weight: 700; color: #0f2642; margin-bottom: 10px; }
+.success-body { font-size: 15px; color: #5a6a75; line-height: 1.8; }
+.success-note {
+  margin-top: 24px; background: #e1f5ee; border-radius: 10px;
+  padding: 14px; font-size: 13px; color: #0e6e5c;
+}
+
+@media (max-width: 520px) {
+  .field-row, .card-row { grid-template-columns: 1fr; }
+  .features { flex-direction: column; }
+  .feat { border: none; border-bottom: 1px solid #e0ede9; }
+}
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <div class="top-logo">⚓ SafeHarbor</div>
+  <div class="top-note">תשלום מאובטח · SSL · Tranzila</div>
+</div>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-icon">⚓</div>
+  <h1>מנוי אישי ל-SafeHarbor</h1>
+  <p>גישה אישית לעוזר AI לעיגון והרגעה — זמין 24/7, בעברית, בדיסקרטיות מלאה.</p>
+</div>
+
+<!-- FEATURES -->
+<div class="features">
+  <div class="feat"><strong>24/7</strong>זמין תמיד</div>
+  <div class="feat"><strong>עברית</strong>שפה טבעית</div>
+  <div class="feat"><strong>דיסקרטי</strong>פרטיות מלאה</div>
+  <div class="feat"><strong>30 יום</strong>ניסיון חינם</div>
+</div>
+
+<!-- PLAN -->
+<div class="plan-wrap">
+  <div class="plan-card">
+    <div class="plan-badge">מנוי אישי</div>
+    <div class="plan-name">גישה חודשית אישית</div>
+    <div class="plan-price">
+      <span class="currency">₪</span>
+      <span class="amount">45</span>
+      <span class="period">/ חודש</span>
+    </div>
+    <div class="plan-trial">✓ 30 ימי ניסיון חינם לפני החיוב הראשון</div>
+    <ul class="plan-features">
+      <li><span class="chk">✓</span> גישה מלאה לכלי העיגון וההרגעה</li>
+      <li><span class="chk">✓</span> עברית טבעית ומכבדת</li>
+      <li><span class="chk">✓</span> זמין 24/7 — גם בלילה</li>
+      <li><span class="chk">✓</span> פרטיות מלאה — אין שמירת שיחות</li>
+      <li><span class="chk">✓</span> ביטול בכל עת, ללא קנס</li>
+    </ul>
+  </div>
+</div>
+
+<!-- FORM -->
+<div class="payment-form" id="paymentForm">
+
+  <div class="form-title">פרטי תשלום</div>
+  <div class="form-subtitle">מנוי אישי · ₪45 / חודש · 30 יום ניסיון חינם</div>
+
+  <div class="trial-reminder">
+    לא יחויב כלום עד סוף 30 ימי הניסיון. ביטול בכל עת.
+  </div>
+
+  <div class="tranzila-note">
+    <span>🔒</span>
+    התשלום מעובד באופן מאובטח דרך <strong>Tranzila</strong> — PCI DSS Level 1. פרטי הכרטיס מוצפנים ואינם נשמרים אצלנו.
+  </div>
+
+  <!-- שם ואימייל -->
+  <div class="field-row">
+    <div class="field">
+      <label>שם פרטי *</label>
+      <input type="text" id="payFirstName" placeholder="ישראל" required />
+    </div>
+    <div class="field">
+      <label>שם משפחה *</label>
+      <input type="text" id="payLastName" placeholder="ישראלי" required />
+    </div>
+  </div>
+  <div class="field">
+    <label>אימייל *</label>
+    <input type="email" id="payEmail" placeholder="israel@example.com" style="direction:ltr" required />
+  </div>
+  <div class="field">
+    <label>טלפון *</label>
+    <input type="tel" id="payPhone" placeholder="050-0000000" style="direction:ltr" required />
+  </div>
+
+  <!-- פרטי כרטיס -->
+  <div class="field">
+    <label>מספר כרטיס אשראי *</label>
+    <input type="text" id="cardNumber" placeholder="0000 0000 0000 0000"
+      maxlength="19" style="direction:ltr; letter-spacing:2px"
+      oninput="formatCard(this)" required />
+  </div>
+  <div class="card-row">
+    <div class="field">
+      <label>תוקף (MM/YY) *</label>
+      <input type="text" id="cardExpiry" placeholder="12/27"
+        maxlength="5" style="direction:ltr" oninput="formatExpiry(this)" required />
+    </div>
+    <div class="field">
+      <label>CVV *</label>
+      <input type="text" id="cardCVV" placeholder="123" maxlength="4" style="direction:ltr" required />
+    </div>
+    <div class="field">
+      <label>תעודת זהות *</label>
+      <input type="text" id="cardID" placeholder="000000000" maxlength="9" required />
+    </div>
+  </div>
+
+  <!-- סיכום -->
+  <div class="summary-box">
+    <div class="summary-row"><span class="muted">חבילה</span><span>מנוי אישי חודשי</span></div>
+    <div class="summary-row"><span class="muted">ניסיון חינם</span><span>30 יום</span></div>
+    <div class="summary-row"><span class="muted">חיוב ראשון</span><span>אחרי 30 יום</span></div>
+    <div class="summary-row"><span class="muted">חידוש אוטומטי</span><span>כל חודש</span></div>
+    <div class="summary-row total"><span>סה"כ לחיוב היום</span><span>₪0</span></div>
+  </div>
+
+  <button class="submit-btn" id="submitBtn" onclick="submitPayment()">
+    התחל 30 יום חינם ←
+  </button>
+
+  <div class="form-footer">
+    החיוב הראשון (₪45) יתבצע רק לאחר סיום תקופת הניסיון.<br>
+    ביטול ניתן בכל עת ללא קנס. לשאלות: alex@alargov.com
+  </div>
+
+</div>
+
+<!-- SUCCESS -->
+<div class="success-screen" id="successScreen">
+  <div class="success-icon">⚓</div>
+  <div class="success-title">ברוך הבא ל-SafeHarbor!</div>
+  <div class="success-body">
+    הפרטים התקבלו.<br>
+    תקופת הניסיון שלך של <strong>30 יום</strong> מתחילה עכשיו.<br>
+    שלחנו לך קישור גישה אישי למייל.
+  </div>
+  <div class="success-note">
+    לא יחויב כלום עד <strong id="trialEndDate"></strong>.<br>
+    ביטול בכל עת דרך alex@alargov.com
+  </div>
+</div>
+
+<script>
+function formatCard(el) {
+  let v = el.value.replace(/\D/g,'').substring(0,16);
+  el.value = v.replace(/(\d{4})(?=\d)/g,'$1 ');
+}
+function formatExpiry(el) {
+  let v = el.value.replace(/\D/g,'').substring(0,4);
+  if (v.length >= 2) v = v.substring(0,2) + '/' + v.substring(2);
+  el.value = v;
+}
+
+function submitPayment() {
+  const btn = document.getElementById('submitBtn');
+  const fn  = document.getElementById('payFirstName').value.trim();
+  const ln  = document.getElementById('payLastName').value.trim();
+  const em  = document.getElementById('payEmail').value.trim();
+  const ph  = document.getElementById('payPhone').value.trim();
+  const cn  = document.getElementById('cardNumber').value.replace(/\s/g,'');
+  const ex  = document.getElementById('cardExpiry').value.trim();
+  const cv  = document.getElementById('cardCVV').value.trim();
+  const id  = document.getElementById('cardID').value.trim();
+
+  if (!fn || !ln || !em || !ph || cn.length < 15 || ex.length < 5 || cv.length < 3 || !id) {
+    alert('אנא מלא את כל השדות הנדרשים.');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'מעבד...';
+
+  // ── Tranzila POST ──
+  // החלף YOUR_TERMINAL_NAME בשם הטרמינל מ-Tranzila
+  const TRANZILA_TERMINAL = 'YOUR_TERMINAL_NAME';
+
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = 'https://secure5.tranzila.com/cgi-bin/tranzila71u.cgi';
+  form.style.display = 'none';
+
+  // ניסיון: סכום = 0, חיוב עתידי של 45 ₪ כל חודש
+  const fields = {
+    supplier:    TRANZILA_TERMINAL,
+    sum:         '0',          // לא מחייב היום
+    currency:    '1',          // ILS
+    ccno:        cn,
+    expdate:     ex.replace('/',''),
+    mycvv:       cv,
+    id:          id,
+    email:       em,
+    contact:     fn + ' ' + ln,
+    phone:       ph,
+    cred_type:   '1',
+    tranmode:    'V',          // V = וידוא כרטיס בלבד (לא חיוב)
+    noredirect:  '1',
+    // לחיוב חוזר מדי חודש — הגדר ב-Tranzila לוח חיובים
+    // recurr_exp:  '9999',     // תוקף מנוי
+    // recurr_sum:  '45',       // סכום חוזר
+    // recurr_freq: '1',        // כל חודש
+  };
+
+  Object.entries(fields).forEach(([k,v]) => {
+    const i = document.createElement('input');
+    i.type = 'hidden'; i.name = k; i.value = v;
+    form.appendChild(i);
+  });
+
+  document.body.appendChild(form);
+
+  // סיום ניסיון
+  const trialEnd = new Date();
+  trialEnd.setDate(trialEnd.getDate() + 30);
+  document.getElementById('trialEndDate').textContent = trialEnd.toLocaleDateString('he-IL');
+
+  // בפיתוח — סימולציה:
+  setTimeout(() => {
+    document.getElementById('paymentForm').style.display   = 'none';
+    document.querySelector('.plan-wrap').style.display     = 'none';
+    document.querySelector('.features').style.display      = 'none';
+    document.querySelector('.hero').style.paddingBottom    = '8px';
+    document.getElementById('successScreen').style.display = 'block';
+  }, 1800);
+
+  // בייצור — הסר setTimeout והשתמש ב:
+  // form.submit();
+}
+</script>
+</body>
+</html>
