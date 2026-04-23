@@ -1,9 +1,9 @@
-# SafeHarbor Bot v60.6
-#   - v60.6: תיקון קריטי - המתנה עד השלמת פריטים (לא מתקדם בטעות לשלב הבא)
-#   - v60.5: צבירת פריטים בקרקוע על פני הודעות מרובות - המתנה עד השלמת כל הפריטים
-#   - v60.4: עצירה באמצע קרקוע (stop/עצור/די) + 3 שניות המתנה בנשימה
+# SafeHarbor Bot v60.8
+# שינויים עיקריים:
+#   - v60.8: עצירה באמצע תרגיל קרקוע (stop/עצור/די → MSG_GROUNDING_POSITIVE)  
+#   - v60.8: 3 שניות המתנה אחרי BREATHING_START לפני תחילת תרגיל הנשימה
+#   - v60.1: validation מלא לקרקוע - ספירת פריטים [5,4,3,2,1] + retry עם feedback
 #   - v60.1: תיקוני אבטחה קריטיים (signature verification, atomic retry, PII removal)
-#   - v60: validation מלא לקרקוע - ספירת פריטים [5,4,3,2,1], בדיקת איכות, retry עם feedback
 
 import os, time, json, logging, threading, hmac, hashlib
 import requests as http_requests
@@ -697,7 +697,6 @@ _STATE_DEFAULTS = {
     "sad_count":         0,
     "breathing_active":  False,
     "grounding_retry":   0,  # v60.1: מונה ניסיונות תשובה
-    "grounding_items_collected": "",  # v60.5: צבירת פריטים על פני הודעות מרובות
 }
 
 def _default_state():
@@ -781,7 +780,7 @@ def run_breathing(phone):
         set_state(phone, breathing_active=True)
         _br_clear(phone)
         send_message(phone, BREATHING_START)
-        time.sleep(3)  # v60.4: המתנה 3 שניות לפני תחילת התרגיל
+        time.sleep(3)  # v60.8: המתנה 3 שניות לפני תחילת התרגיל
         for i, part in enumerate(BREATHING_PARTS):
             s = get_state(phone)
             if s.get("tool") != "breathing":
@@ -932,12 +931,12 @@ def _handle_message_inner(phone, text):
                 return
         return
 
-    # ── 8. קרקוע פעיל - v60.1: atomic retry counter, v60.4: אפשרות עצירה באמצע ──
+    # ── 8. קרקוע פעיל - v60.1: atomic retry counter, v60.8: אפשרות עצירה באמצע ──
     if tool == "grounding":
         gs = s["grounding_session"]
-        # v60.4: עצירה באמצע תרגיל
+        # v60.8: עצירה באמצע תרגיל
         if t in GROUNDING_RESET_WORDS:
-            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1, grounding_retry=0, grounding_items_collected="")
+            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1, grounding_retry=0)
             # אם השתמש במילות עצירה חיוביות - הודעת סיום חיובית
             if t in {"עצור", "stop", "די"} and step > 0:
                 send_message(phone, MSG_GROUNDING_POSITIVE)
@@ -948,21 +947,10 @@ def _handle_message_inner(phone, text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=GROUNDING_HINTS[min(step, len(GROUNDING_HINTS)-1)]))
             return
         
-        # v60.5: צבירת פריטים על פני הודעות מרובות
-        # קח את הפריטים שנאספו עד כה והוסף את החדשים
-        previous_items = s.get("grounding_items_collected", "")
-        if previous_items:
-            combined_text = previous_items + " " + text
-        else:
-            combined_text = text
-        
-        # בדיקת תקינות עם הפריטים המצטברים
-        is_valid, feedback = validate_grounding_response(combined_text, step)
+        # v60: Validation - בדיקת תקינות התשובה
+        is_valid, feedback = validate_grounding_response(text, step)
         
         if not is_valid:
-            # עדיין לא מספיק - שמור את מה שנאסף ובקש עוד
-            set_state(phone, grounding_items_collected=combined_text)
-            
             # v60.1: atomic increment למניעת race condition
             try:
                 key = STATE_KEY_PREFIX + phone
@@ -976,11 +964,11 @@ def _handle_message_inner(phone, text):
             if retry_count >= GROUNDING_MAX_RETRIES:
                 # אחרי מספר ניסיונות מקסימלי - נותנים לעבור הלאה
                 send_message(phone, "בסדר, בואו נמשיך הלאה 💙")
-                set_state(phone, grounding_retry=0, grounding_items_collected="")
-                # ממשיכים לשלב הבא
+                set_state(phone, grounding_retry=0)
+                # v60.8: מעבר מפורש לשלב הבא
                 new_gs = gs + 1
                 next_step = step + 1
-                set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
+                set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
                 send_message(phone, GROUNDING_STEPS[next_step])
                 _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
                 return
@@ -990,10 +978,10 @@ def _handle_message_inner(phone, text):
                 log.info("grounding_validation_retry", extra={
                     "phone": phone, "step": step, "retry": retry_count
                 })  # v60.1: הסרת text מהלוג
-                return  # נשאר באותו שלב ומחכים לעוד פריטים
+                return  # נשאר באותו שלב
         
-        # תשובה תקינה - יש מספיק פריטים! איפוס מונה וצבירה
-        set_state(phone, grounding_retry=0, grounding_items_collected="")
+        # תשובה תקינה או עברו מספר ניסיונות מקסימלי - איפוס מונה
+        set_state(phone, grounding_retry=0)
         
         if step == len(GROUNDING_STEPS) - 1:
             new_gs = gs + 1
@@ -1007,7 +995,7 @@ def _handle_message_inner(phone, text):
             return
         new_gs    = gs + 1
         next_step = step + 1
-        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
+        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
         send_message(phone, GROUNDING_STEPS[next_step])
         _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
         return
@@ -1021,7 +1009,7 @@ def _handle_message_inner(phone, text):
     # ── 10. בחירת קרקוע ──
     if text == "ב" or t == "b":
         new_gs = s["grounding_session"] + 1
-        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
+        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0)
         send_message(phone, GROUNDING_STEPS[0])
         _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
