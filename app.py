@@ -1,4 +1,5 @@
-# SafeHarbor Bot v60.5
+# SafeHarbor Bot v60.6
+#   - v60.6: תיקון קריטי - המתנה עד השלמת פריטים (לא מתקדם בטעות לשלב הבא)
 #   - v60.5: צבירת פריטים בקרקוע על פני הודעות מרובות - המתנה עד השלמת כל הפריטים
 #   - v60.4: עצירה באמצע קרקוע (stop/עצור/די) + 3 שניות המתנה בנשימה
 #   - v60.1: תיקוני אבטחה קריטיים (signature verification, atomic retry, PII removal)
@@ -977,6 +978,12 @@ def _handle_message_inner(phone, text):
                 send_message(phone, "בסדר, בואו נמשיך הלאה 💙")
                 set_state(phone, grounding_retry=0, grounding_items_collected="")
                 # ממשיכים לשלב הבא
+                new_gs = gs + 1
+                next_step = step + 1
+                set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
+                send_message(phone, GROUNDING_STEPS[next_step])
+                _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
+                return
             else:
                 # תן feedback ונשאר באותו שלב
                 send_message(phone, feedback)
