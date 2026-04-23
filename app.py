@@ -1,25 +1,8 @@
-# SafeHarbor Bot v60.4
-# שינויים מ-v59:
-#   - v60.4: עצירה באמצע תרגיל קרקוע (stop/עצור/די → MSG_GROUNDING_POSITIVE)
-#   - v60.4: 3 שניות המתנה אחרי BREATHING_START לפני תחילת תרגיל הנשימה
-#   - v60.1: תיקוני אבטחה קריטיים לפני production
-#   - v60.1: הסרת hardcoded ADMIN_API_KEY, דרישה ממשתנה סביבה
-#   - v60.1: הסרת fallback מסוכן ב-signature verification
-#   - v60.1: תיקון race condition ב-grounding retry (atomic increment)
-#   - v60.1: שיפור validate_grounding_response (regex, error handling, סף מחמיר)
-#   - v60.1: הסרת PII מלוגים
-#   - v60.1: הוספת grounding_retry ל-STATE_DEFAULTS
-#   - v60: הוספת validation לתרגיל קרקוע (בדיקת מספר פריטים ואיכות)
-#   - v60: מנגנון retry - עד 2 ניסיונות לפני מעבר הלאה
-#   - v60: feedback ברור למשתמש על תשובות חסרות
-#   - v59: הוספת _verify_meta_signature (Meta webhook signature verification)
-#   - v59: הסרת ADMIN_API_KEY מ-JavaScript בדשבורד
-#   - v59: audit log לכל פעולת admin
-#   - v59: rate limit חזק יותר על admin routes (5/דקה במקום 10)
-#   - v59: שיפור is_grounding_positive לתשובות מעורבות
-#   - v59: cleanup תקופתי ל-Redis metrics
-#   - v59: STATE_TTL מוגדר ל-30 יום
-#   - v59: הרחבת DELETE_DATA_WORDS
+# SafeHarbor Bot v60.5
+#   - v60.5: צבירת פריטים בקרקוע על פני הודעות מרובות - המתנה עד השלמת כל הפריטים
+#   - v60.4: עצירה באמצע קרקוע (stop/עצור/די) + 3 שניות המתנה בנשימה
+#   - v60.1: תיקוני אבטחה קריטיים (signature verification, atomic retry, PII removal)
+#   - v60: validation מלא לקרקוע - ספירת פריטים [5,4,3,2,1], בדיקת איכות, retry עם feedback
 
 import os, time, json, logging, threading, hmac, hashlib
 import requests as http_requests
@@ -713,6 +696,7 @@ _STATE_DEFAULTS = {
     "sad_count":         0,
     "breathing_active":  False,
     "grounding_retry":   0,  # v60.1: מונה ניסיונות תשובה
+    "grounding_items_collected": "",  # v60.5: צבירת פריטים על פני הודעות מרובות
 }
 
 def _default_state():
@@ -952,7 +936,7 @@ def _handle_message_inner(phone, text):
         gs = s["grounding_session"]
         # v60.4: עצירה באמצע תרגיל
         if t in GROUNDING_RESET_WORDS:
-            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1, grounding_retry=0)
+            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1, grounding_retry=0, grounding_items_collected="")
             # אם השתמש במילות עצירה חיוביות - הודעת סיום חיובית
             if t in {"עצור", "stop", "די"} and step > 0:
                 send_message(phone, MSG_GROUNDING_POSITIVE)
@@ -963,10 +947,21 @@ def _handle_message_inner(phone, text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=GROUNDING_HINTS[min(step, len(GROUNDING_HINTS)-1)]))
             return
         
-        # v60: Validation - בדיקת תקינות התשובה
-        is_valid, feedback = validate_grounding_response(text, step)
+        # v60.5: צבירת פריטים על פני הודעות מרובות
+        # קח את הפריטים שנאספו עד כה והוסף את החדשים
+        previous_items = s.get("grounding_items_collected", "")
+        if previous_items:
+            combined_text = previous_items + " " + text
+        else:
+            combined_text = text
+        
+        # בדיקת תקינות עם הפריטים המצטברים
+        is_valid, feedback = validate_grounding_response(combined_text, step)
         
         if not is_valid:
+            # עדיין לא מספיק - שמור את מה שנאסף ובקש עוד
+            set_state(phone, grounding_items_collected=combined_text)
+            
             # v60.1: atomic increment למניעת race condition
             try:
                 key = STATE_KEY_PREFIX + phone
@@ -980,7 +975,7 @@ def _handle_message_inner(phone, text):
             if retry_count >= GROUNDING_MAX_RETRIES:
                 # אחרי מספר ניסיונות מקסימלי - נותנים לעבור הלאה
                 send_message(phone, "בסדר, בואו נמשיך הלאה 💙")
-                set_state(phone, grounding_retry=0)
+                set_state(phone, grounding_retry=0, grounding_items_collected="")
                 # ממשיכים לשלב הבא
             else:
                 # תן feedback ונשאר באותו שלב
@@ -988,10 +983,10 @@ def _handle_message_inner(phone, text):
                 log.info("grounding_validation_retry", extra={
                     "phone": phone, "step": step, "retry": retry_count
                 })  # v60.1: הסרת text מהלוג
-                return  # נשאר באותו שלב
+                return  # נשאר באותו שלב ומחכים לעוד פריטים
         
-        # תשובה תקינה או עברו מספר ניסיונות מקסימלי - איפוס מונה
-        set_state(phone, grounding_retry=0)
+        # תשובה תקינה - יש מספיק פריטים! איפוס מונה וצבירה
+        set_state(phone, grounding_retry=0, grounding_items_collected="")
         
         if step == len(GROUNDING_STEPS) - 1:
             new_gs = gs + 1
@@ -1005,7 +1000,7 @@ def _handle_message_inner(phone, text):
             return
         new_gs    = gs + 1
         next_step = step + 1
-        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
+        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
         send_message(phone, GROUNDING_STEPS[next_step])
         _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
         return
@@ -1019,7 +1014,7 @@ def _handle_message_inner(phone, text):
     # ── 10. בחירת קרקוע ──
     if text == "ב" or t == "b":
         new_gs = s["grounding_session"] + 1
-        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0)
+        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0, grounding_items_collected="")
         send_message(phone, GROUNDING_STEPS[0])
         _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
