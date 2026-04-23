@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SafeHarbor Simulator v60.1 (Fixed)</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Hebrew:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Noto Sans Hebrew', sans-serif;
+  background: #111b21;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 16px; gap: 16px;
+}
+.phone-frame {
+  width: 390px; height: 844px; background: #111b21;
+  border-radius: 44px; border: 2px solid #2a3942; overflow: hidden;
+  display: flex; flex-direction: column;
+  box-shadow: 0 32px 80px rgba(0,0,0,0.7);
+}
+.header {
+  background: #202c33; padding: 10px 16px;
+  display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid #2a3942; flex-shrink: 0;
+}
+.avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: linear-gradient(135deg, #00a884, #025c4c);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+}
+.contact-info { flex: 1; }
+.contact-name { color: #e9edef; font-size: 15px; font-weight: 500; }
+.contact-status { color: #8696a0; font-size: 12px; }
+.chat-bg {
+  flex: 1; overflow-y: auto; padding: 12px;
+  background: #0b1419;
+}
+.msg {
+  max-width: 80%; padding: 8px 12px; border-radius: 8px;
+  margin-bottom: 8px; font-size: 14px; line-height: 1.5;
+  word-wrap: break-word; white-space: pre-wrap;
+}
+.msg.bot {
+  background: #005c4b; color: #e9edef; align-self: flex-start;
+}
+.msg.user {
+  background: #202c33; color: #e9edef; align-self: flex-end;
+  margin-left: auto;
+}
+.input-area {
+  background: #202c33; padding: 8px 12px;
+  display: flex; gap: 8px; align-items: center;
+  border-top: 1px solid #2a3942; flex-shrink: 0;
+}
+#input {
+  flex: 1; background: #2a3942; border: none;
+  padding: 10px 12px; border-radius: 20px;
+  color: #e9edef; font-size: 14px;
+  font-family: 'Noto Sans Hebrew', sans-serif;
+}
+#send {
+  background: #00a884; border: none; color: #fff;
+  width: 44px; height: 44px; border-radius: 50%;
+  cursor: pointer; font-size: 18px;
+}
+.quick-btns {
+  display: flex; gap: 6px; margin: 8px 0;
+}
+.quick-btn {
+  background: #2a3942; border: none; color: #00a884;
+  padding: 6px 12px; border-radius: 12px;
+  cursor: pointer; font-size: 13px;
+  font-family: 'Noto Sans Hebrew', sans-serif;
+}
+.side-panel {
+  width: 340px; background: #1e1e1e; border-radius: 16px;
+  padding: 20px; color: #ccc; overflow-y: auto;
+  max-height: 844px; flex-shrink: 0;
+}
+.state-item { margin-bottom: 12px; font-size: 13px; }
+.state-key { color: #00a884; font-weight: 600; }
+.state-val { color: #e9edef; }
+.debug-log {
+  background: #0d0d0d; padding: 12px; border-radius: 8px;
+  font-size: 12px; font-family: monospace;
+  max-height: 300px; overflow-y: auto;
+  margin-top: 16px;
+}
+.debug-entry { margin-bottom: 4px; color: #8696a0; }
+.debug-entry.warn { color: #ffa500; }
+.debug-entry.error { color: #ff4444; }
+</style>
+</head>
+<body>
+
+<div class="phone-frame">
+  <div class="header">
+    <div class="avatar">🏠</div>
+    <div class="contact-info">
+      <div class="contact-name">נמל הבית ⚓</div>
+      <div class="contact-status">SafeHarbor Bot v60.1</div>
+    </div>
+  </div>
+  
+  <div class="chat-bg" id="chat"></div>
+  
+  <div class="input-area">
+    <input type="text" id="input" placeholder="הקלד הודעה..." autocomplete="off">
+    <button id="send">▲</button>
+  </div>
+</div>
+
+<div class="side-panel">
+  <h3 style="color:#00a884; margin-bottom:16px; font-size:16px;">State Monitor</h3>
+  <div id="state-display"></div>
+  
+  <div style="margin-top:20px;">
+    <h4 style="color:#00a884; margin-bottom:8px; font-size:14px;">Quick Actions</h4>
+    <div class="quick-btns">
+      <button class="quick-btn" onclick="quickSend('א')">נשימה</button>
+      <button class="quick-btn" onclick="quickSend('ב')">קרקוע</button>
+    </div>
+    <div class="quick-btns">
+      <button class="quick-btn" onclick="quickSend('כן')">כן</button>
+      <button class="quick-btn" onclick="quickSend('לא')">לא</button>
+    </div>
+    <div class="quick-btns">
+      <button class="quick-btn" onclick="quickSend('שולחן, כיסא, חלון, דלת, מנורה')">5 פריטים</button>
+    </div>
+    <div class="quick-btns">
+      <button class="quick-btn" onclick="quickSend('א, ב, ג')">3 תווים (חלש)</button>
+    </div>
+    <div class="quick-btns">
+      <button class="quick-btn" onclick="resetState()">🔄 Reset</button>
+    </div>
+  </div>
+  
+  <div class="debug-log" id="debug"></div>
+</div>
+
+<script>
+// ── Messages ──
+const MSG_WELCOME = `*שלום, אני נמל הבית* ⚓
+אני כאן איתך כדי לעזור לך למצוא קצת שקט ולהתייצב ברגעים שמרגישים עמוסים או כבדים.
+
+אם אתה מרגיש שקשה להתמודד לבד, דע שתמיד יש מי שמקשיב ומחכה לך:
+☎️ ער"ן: 1201 | 💬 https://wa.me/972528451201
+💬 סה"ר: https://wa.me/972543225656
+☎️ נט"ל: 1-800-363-363
+
+*מה יעזור לך יותר ברגע הזה?*
+🌬️ הקש *א* — תרגילי נשימה
+⚓ הקש *ב* — תרגיל קרקוע`;
+
+const MSG_RETURNING = `היי, טוב שחזרת אלי. 💙
+אני נמל הבית, ואני כאן איתך שוב.
+
+*מה מרגיש לך נכון יותר ברגע הזה?*
+🌬️ הקש *א* — נשימה מרגיעה
+⚓ הקש *ב* — תרגיל קרקוע
+
+זכור שיש עזרה אנושית זמינה עבורך תמיד:
+☎️ ער"ן: 1201 | 💬 https://wa.me/972528451201
+💬 סה"ר: https://wa.me/972543225656
+☎️ נט"ל: 1-800-363-363`;
+
+const MSG_CRISIS = `אני מבינה שאתה עובר רגע קשה מאוד. אני כאן איתך. 💙
+
+*יש מי שרוצה לעזור לך — פנה אליהם עכשיו:*
+☎️ ער"ן: 1201
+💬 https://wa.me/972528451201
+💬 סה"ר: https://wa.me/972543225656
+☎️ נט"ל: 1-800-363-363`;
+
+const MSG_OFF_TOPIC = `אני כאן כדי לעזור לך להתייצב. ⚓
+
+הקש *א* לתרגיל נשימה 🌬️
+הקש *ב* לתרגיל קרקוע ⚓`;
+
+const MSG_BREATHING_STOP = `יופי שעצרת רגע להקשיב לעצמך 🌿
+אפשר להישאר עם התחושה הזו עוד כמה שניות, בקצב שנוח לך 🕊️
+
+אם תרצה לחזור לזה בהמשך, אני כאן ⚓`;
+
+const MSG_GROUNDING_POSITIVE = `יופי שעצרת רגע להקשיב לעצמך 🌿
+אפשר להישאר עם התחושה הזו עוד כמה שניות, בקצב שנוח לך 🕊️
+
+אם תרצה לחזור לזה בהמשך, אני כאן ⚓`;
+
+const MSG_BREATHING_WAIT_CONFIRM = "הקש *כן* להמשך סבב נוסף, או *לא* לעצור. 🌬️";
+const MSG_RESET = "בסדר, אני כאן כשתצטרך. 🌊";
+const BREATHING_START = "אני כאן איתך בוא נספור יחד. 🌬️";
+
+const BREATHING_PARTS = [
+  "⬅️ שאיפה איטית... 21-22-23-24-25",
+  "✋ עצור... 21-22-23-24-25",
+  "➡️ נשיפה איטית... 21-22-23-24-25",
+  "⚓ מנוחה... 21-22-23-24-25",
+  "⬅️ שאיפה איטית... 21-22-23-24-25",
+  "✋ עצור... 21-22-23-24-25",
+  "➡️ נשיפה איטית... 21-22-23-24-25",
+  "⚓ מנוחה... 21-22-23-24-25",
+  "⬅️ שאיפה איטית... 21-22-23-24-25",
+  "✋ עצור... 21-22-23-24-25",
+  "➡️ נשיפה איטית... 21-22-23-24-25",
+  "⚓ מנוחה... 21-22-23-24-25",
+  "סיימנו 3 סבבים. איך התחושה? נמשיך? (כן/לא)"
+];
+
+const GROUNDING_STEPS = [
+  "👀 בוא נתמקד ברגע הזה. ציין 5 דברים שאתה רואה סביבך כרגע.",
+  "🤚 מצוין. עכשיו, 4 דברים שאתה יכול לגעת בהם כרגע.",
+  "👂 יופי. עכשיו, 3 דברים שאתה שומע סביבך.",
+  "👃 מעולה. עכשיו, 2 דברים שאתה יכול להריח.",
+  "👅 ודבר אחד שאתה יכול לטעום (או טעם שמרגיע אותך).",
+  "💙 איך התחושה עכשיו?"
+];
+
+const GROUNDING_NUDGE_1 = "💙 אני כאן איתך. מצאת משהו אחד?";
+const GROUNDING_NUDGE_2 = "⏳ נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן.";
+
+const GROUNDING_CHAT_REPLY = "אני כאן רק כדי לעזור לך להתייצב. נסה לציין דברים שאתה {hint} כרגע.";
+const GROUNDING_HINTS = ["רואה", "יכול לגעת בהם", "שומע", "מריח", "יכול לטעום", "מרגיש"];
+
+const GROUNDING_EXPECTED_COUNTS = [5, 4, 3, 2, 1];
+const GROUNDING_MAX_RETRIES = 2;
+
+const BREATHING_YES_WORDS = new Set([
+  "כן", "כ", "כן כן", "בטח", "אוקיי", "אוקי", "טוב", "סבבה", "נו",
+  "המשך", "עוד", "עוד סבב", "נמשיך", "קדימה", "יאללה", "רוצה עוד", "כן בבקשה",
+  "yes", "y", "sure", "ok", "okay", "yep", "yeah", "yup", "continue", "more", "go", "again"
+]);
+
+const BREATHING_STOP_WORDS = new Set(["לא", "ל", "no", "n", "די", "stop", "done", "סיום", "עצור"]);
+const GREET_WORDS = new Set(["שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"]);
+const GROUNDING_RESET_WORDS = new Set(["חזור", "איפוס", "reset", "back", "stop", "די"]);
+
+const GROUNDING_POSITIVE_RE = /טוב|טובה|בסדר|יותר טוב|עזר|נרגע|רגוע|רגועה|שקט|שקטה|מצוין|מעולה|יפה|סבבה|אחלה|good|better|great|calm|calmer|relaxed|nice|fine|helped/i;
+
+const GROUNDING_NEGATIVE_RE = /לא טוב|לא בסדר|עדיין|קשה|כבד|לא עזר|לא עזרה|לא הרגשתי|לא השתנה|אבל.*(קשה|כבד|עדיין)|קצת.*(קשה|כבד)|not good|not better|still|hard|heavy|didn.t help|no change|but.*(hard|heavy|still)|a bit.*(hard|heavy)/i;
+
+const CRISIS_RE = /להתאבד|לסיים הכל|להיעלם|רוצה למות|בא לי למות|לחתוך את עצמי|לחתוך|להפסיק את הסבל|suicide|kill myself|want to die|end my life/i;
+
+// v60.1: State תואם לקוד Python
+const state = {
+  tool: 'none',
+  step: 0,
+  welcomed: false,
+  breathing_active: false,
+  breathing_reply: null,
+  grounding_session: 0,
+  grounding_retry: 0  // v60.1: מונה ניסיונות כמו בקוד
+};
+
+function addMsg(text, isUser) {
+  const chat = document.getElementById('chat');
+  const msg = document.createElement('div');
+  msg.className = 'msg ' + (isUser ? 'user' : 'bot');
+  msg.textContent = text;
+  chat.appendChild(msg);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function debug(text, level = 'info') {
+  const log = document.getElementById('debug');
+  const entry = document.createElement('div');
+  entry.className = 'debug-entry';
+  if (level === 'warn') entry.classList.add('warn');
+  if (level === 'error') entry.classList.add('error');
+  entry.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+  log.appendChild(entry);
+  log.scrollTop = log.scrollHeight;
+}
+
+function updateStateUI() {
+  const el = document.getElementById('state-display');
+  el.innerHTML = `
+    <div class="state-item"><span class="state-key">tool:</span> <span class="state-val">${state.tool}</span></div>
+    <div class="state-item"><span class="state-key">step:</span> <span class="state-val">${state.step}</span></div>
+    <div class="state-item"><span class="state-key">welcomed:</span> <span class="state-val">${state.welcomed}</span></div>
+    <div class="state-item"><span class="state-key">breathing_active:</span> <span class="state-val">${state.breathing_active}</span></div>
+    <div class="state-item"><span class="state-key">breathing_reply:</span> <span class="state-val">${state.breathing_reply || 'null'}</span></div>
+    <div class="state-item"><span class="state-key">grounding_session:</span> <span class="state-val">${state.grounding_session}</span></div>
+    <div class="state-item"><span class="state-key">grounding_retry:</span> <span class="state-val">${state.grounding_retry}</span></div>
+  `;
+}
+
+function isGroundingChat(text) {
+  const t = text.toLowerCase().trim();
+  return ['למה', 'מה זה', 'לא הבנתי', 'מה', 'איך', '?'].some(w => t.includes(w));
+}
+
+function isGroundingPositive(text) {
+  if (GROUNDING_NEGATIVE_RE.test(text)) return false;
+  if (GROUNDING_POSITIVE_RE.test(text)) return true;
+  return /^(טוב|בסדר|ok|okay|fine|good|כן)$/i.test(text.trim());
+}
+
+// v60.1: Validation תואמת לקוד Python
+function validateGroundingResponse(text, step) {
+  try {
+    if (step >= GROUNDING_EXPECTED_COUNTS.length) {
+      return { isValid: true, feedback: null };
+    }
+    
+    const expected = GROUNDING_EXPECTED_COUNTS[step];
+    const textClean = text.trim();
+    
+    // ניסיון 1: רשימות ממוספרות
+    const numberedMatch = textClean.match(/\d+[\.\)]\s*([^\d\n]+)/g);
+    let items = [];
+    
+    if (numberedMatch) {
+      items = numberedMatch.map(m => m.replace(/^\d+[\.\)]\s*/, '').trim()).filter(i => i.length > 1);
+    } else {
+      // ניסיון 2: פיצול לפי מפרידים - regex אחד
+      let temp = textClean.replace(/[,\n•;\-]|\s+ו\s+/g, '|');
+      items = temp.split('|').map(i => i.trim()).filter(i => i.length > 1);
+      
+      if (items.length < expected) {
+        const words = textClean.split(/\s+/);
+        if (words.length >= expected * 1.5) {
+          items = words;
+        }
+      }
+      
+      items = items.filter(i => i.trim().length > 1);
+    }
+    
+    const count = items.length;
+    
+    // בדיקה 1: מספר פריטים
+    if (count < expected) {
+      const diff = expected - count;
+      const feedbackOptions = [
+        `נראה שציינת ${count} דברים, אבל ביקשתי ${expected}. אפשר עוד ${diff}? 💙`,
+        `קיבלתי רק ${count}, צריך ${expected} דברים. תוסיף עוד ${diff}? 🌿`
+      ];
+      return { isValid: false, feedback: feedbackOptions[count % 2] };
+    }
+    
+    // בדיקה 2: איכות - v60.1: סף 3 תווים
+    if (count >= expected) {
+      const relevantItems = items.slice(0, expected);
+      const avgLen = relevantItems.reduce((sum, item) => sum + item.length, 0) / relevantItems.length;
+      
+      if (avgLen < 3) {
+        return {
+          isValid: false,
+          feedback: "נראה שהתשובות קצרות מדי. תוכל לתאר יותר? (למשל: 'שולחן חום' במקום 'ש') 🔍"
+        };
+      }
+    }
+    
+    return { isValid: true, feedback: null };
+    
+  } catch (e) {
+    debug(`validation error: ${e.message}`, 'error');
+    return { isValid: true, feedback: null };
+  }
+}
+
+async function runBreathing() {
+  addMsg(BREATHING_START, false);
+  state.breathing_active = true;
+  updateStateUI();
+  
+  for (let i = 0; i < BREATHING_PARTS.length; i++) {
+    if (state.tool !== 'breathing') break;
+    
+    if (i === BREATHING_PARTS.length - 1) {
+      state.breathing_active = false;
+      updateStateUI();
+      addMsg(BREATHING_PARTS[i], false);
+      
+      await new Promise(resolve => {
+        const check = setInterval(() => {
+          if (state.breathing_reply !== null) {
+            clearInterval(check);
+            const reply = state.breathing_reply;
+            state.breathing_reply = null;
+            if (reply === 'yes') {
+              state.step = 0;
+              updateStateUI();
+              debug('RESTART breathing');
+              resolve('continue');
+            } else {
+              state.tool = 'none';
+              state.step = 0;
+              updateStateUI();
+              debug('END breathing');
+              addMsg(MSG_BREATHING_STOP, false);
+              resolve('stop');
+            }
+          }
+        }, 100);
+      });
+      
+      if (state.breathing_reply === null && state.tool === 'breathing') {
+        continue;
+      } else {
+        break;
+      }
+    } else {
+      addMsg(BREATHING_PARTS[i], false);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+function handleMessage(text) {
+  const t = text.toLowerCase().trim();
+  
+  // 1. משבר
+  if (CRISIS_RE.test(text)) {
+    state.tool = 'none';
+    state.step = 0;
+    state.breathing_active = false;
+    state.breathing_reply = null;
+    state.grounding_retry = 0;
+    updateStateUI();
+    debug('CRISIS detected', 'error');
+    addMsg(MSG_CRISIS, false);
+    return;
+  }
+  
+  // 2. משתמש חדש
+  if (!state.welcomed) {
+    state.welcomed = true;
+    updateStateUI();
+    debug('WELCOME new user');
+    addMsg(MSG_WELCOME, false);
+    return;
+  }
+  
+  // 3. נשימה פעילה
+  if (state.tool === 'breathing') {
+    if (BREATHING_STOP_WORDS.has(t)) {
+      state.tool = 'none';
+      state.step = 0;
+      state.breathing_active = false;
+      state.breathing_reply = 'no';
+      updateStateUI();
+      debug('STOP breathing (user)');
+      addMsg(MSG_BREATHING_STOP, false);
+      return;
+    }
+    if (!state.breathing_active) {
+      if (BREATHING_YES_WORDS.has(t)) {
+        state.breathing_reply = 'yes';
+        debug('CONTINUE breathing (user yes)');
+        return;
+      } else {
+        addMsg(MSG_BREATHING_WAIT_CONFIRM, false);
+        return;
+      }
+    }
+    return;
+  }
+  
+  // 4. קרקוע פעיל - v60.1: validation + retry logic
+  if (state.tool === 'grounding') {
+    const gs = state.grounding_session;
+    
+    if (GROUNDING_RESET_WORDS.has(t)) {
+      state.tool = 'none';
+      state.step = 0;
+      state.grounding_session++;
+      state.grounding_retry = 0;
+      updateStateUI();
+      debug('RESET grounding');
+      addMsg(MSG_RESET, false);
+      return;
+    }
+    
+    if (isGroundingChat(text)) {
+      const hint = GROUNDING_HINTS[Math.min(state.step, GROUNDING_HINTS.length - 1)];
+      addMsg(GROUNDING_CHAT_REPLY.replace('{hint}', hint), false);
+      return;
+    }
+    
+    // v60.1: Validation
+    const { isValid, feedback } = validateGroundingResponse(text, state.step);
+    
+    if (!isValid) {
+      // v60.1: increment retry counter
+      state.grounding_retry++;
+      updateStateUI();
+      
+      if (state.grounding_retry >= GROUNDING_MAX_RETRIES) {
+        // מקסימום ניסיונות - מעבר הלאה
+        addMsg("בסדר, בואו נמשיך הלאה 💙", false);
+        state.grounding_retry = 0;
+        debug(`GROUNDING step ${state.step} SKIP (max retries)`, 'warn');
+        // ממשיכים לשלב הבא למטה
+      } else {
+        // נותנים feedback ונשארים באותו שלב
+        addMsg(feedback, false);
+        debug(`GROUNDING step ${state.step} RETRY ${state.grounding_retry}/${GROUNDING_MAX_RETRIES}`, 'warn');
+        return; // נשאר באותו שלב
+      }
+    }
+    
+    // תשובה תקינה או עברנו max retries - איפוס ומעבר הלאה
+    state.grounding_retry = 0;
+    
+    // שלב אחרון?
+    if (state.step === GROUNDING_STEPS.length - 1) {
+      state.tool = 'none';
+      state.step = 0;
+      state.grounding_session++;
+      updateStateUI();
+      debug('GROUNDING complete');
+      
+      if (isGroundingPositive(text)) {
+        addMsg(MSG_GROUNDING_POSITIVE, false);
+      } else {
+        addMsg(MSG_RETURNING, false);
+      }
+      return;
+    }
+    
+    // מעבר לשלב הבא
+    state.step++;
+    state.grounding_session++;
+    updateStateUI();
+    debug(`GROUNDING → step ${state.step}`);
+    addMsg(GROUNDING_STEPS[state.step], false);
+    return;
+  }
+  
+  // 5. בחירת נשימה
+  if (text === 'א' || t === 'a') {
+    state.tool = 'breathing';
+    state.step = 0;
+    state.breathing_active = false;
+    state.breathing_reply = null;
+    updateStateUI();
+    debug('START breathing');
+    runBreathing();
+    return;
+  }
+  
+  // 6. בחירת קרקוע
+  if (text === 'ב' || t === 'b') {
+    state.tool = 'grounding';
+    state.step = 0;
+    state.grounding_session++;
+    state.grounding_retry = 0;
+    updateStateUI();
+    debug('START grounding');
+    addMsg(GROUNDING_STEPS[0], false);
+    return;
+  }
+  
+  // 7. ברכה
+  if (GREET_WORDS.has(t)) {
+    addMsg(MSG_RETURNING, false);
+    return;
+  }
+  
+  // 8. off-topic
+  addMsg(MSG_OFF_TOPIC, false);
+}
+
+function sendMessage() {
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+  
+  addMsg(text, true);
+  input.value = '';
+  
+  setTimeout(() => handleMessage(text), 300);
+}
+
+function quickSend(text) {
+  document.getElementById('input').value = text;
+  sendMessage();
+}
+
+function resetState() {
+  state.tool = 'none';
+  state.step = 0;
+  state.welcomed = false;
+  state.breathing_active = false;
+  state.breathing_reply = null;
+  state.grounding_session = 0;
+  state.grounding_retry = 0;
+  updateStateUI();
+  document.getElementById('chat').innerHTML = '';
+  document.getElementById('debug').innerHTML = '';
+  debug('STATE RESET');
+}
+
+// Event listeners
+document.getElementById('send').addEventListener('click', sendMessage);
+document.getElementById('input').addEventListener('keypress', e => {
+  if (e.key === 'Enter') sendMessage();
+});
+
+// Init
+updateStateUI();
+debug('Simulator v60.1 ready');
+</script>
+</body>
+</html>
