@@ -1,5 +1,6 @@
-# SafeHarbor Bot v60.2
+# SafeHarbor Bot v60.3
 # שינויים מ-v59:
+#   - v60.3: עצירה באמצע תרגיל קרקוע עם הודעת MSG_GROUNDING_POSITIVE
 #   - v60.2: 3 שניות המתנה אחרי BREATHING_START לפני תחילת תרגיל הנשימה
 #   - v59: הוספת _verify_meta_signature (Meta webhook signature verification)
 #   - v59: הסרת ADMIN_API_KEY מ-JavaScript בדשבורד
@@ -865,9 +866,14 @@ def _handle_message_inner(phone, text):
     # ── 8. קרקוע פעיל ──
     if tool == "grounding":
         gs = s["grounding_session"]
+        # עצירה באמצע תרגיל
         if t in GROUNDING_RESET_WORDS:
             set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1)
-            send_message(phone, MSG_RESET)
+            # אם השתמש במילות עצירה חיוביות - הודעת סיום חיובית
+            if t in {"עצור", "stop", "די"} and step > 0:
+                send_message(phone, MSG_GROUNDING_POSITIVE)
+            else:
+                send_message(phone, MSG_RESET)
             return
         if is_grounding_chat(text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=GROUNDING_HINTS[min(step, len(GROUNDING_HINTS)-1)]))
