@@ -1,5 +1,12 @@
-# SafeHarbor Bot v60
+# SafeHarbor Bot v60.1
 # שינויים מ-v59:
+#   - v60.1: תיקוני אבטחה קריטיים לפני production
+#   - v60.1: הסרת hardcoded ADMIN_API_KEY, דרישה ממשתנה סביבה
+#   - v60.1: הסרת fallback מסוכן ב-signature verification
+#   - v60.1: תיקון race condition ב-grounding retry (atomic increment)
+#   - v60.1: שיפור validate_grounding_response (regex, error handling, סף מחמיר)
+#   - v60.1: הסרת PII מלוגים
+#   - v60.1: הוספת grounding_retry ל-STATE_DEFAULTS
 #   - v60: הוספת validation לתרגיל קרקוע (בדיקת מספר פריטים ואיכות)
 #   - v60: מנגנון retry - עד 2 ניסיונות לפני מעבר הלאה
 #   - v60: feedback ברור למשתמש על תשובות חסרות
@@ -51,7 +58,7 @@ DEBOUNCE_SEC      = 1.0
 if not VERIFY_TOKEN:
     log.warning("security_warning: VERIFY_TOKEN not set")
 if not WHATSAPP_APP_SECRET:
-    log.warning("security_warning: WHATSAPP_APP_SECRET not set — signature verification disabled")
+    log.error("CRITICAL: WHATSAPP_APP_SECRET not set - webhook signature verification DISABLED")
 
 LOGO_URL = os.environ.get("LOGO_URL", "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png")
 
@@ -88,20 +95,25 @@ def _enqueue(fn, *args):
     else:
         _msg_executor.submit(fn, *args)
 
-ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
+# v60.1: CRITICAL - הסרת hardcoded secret
+ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY")
+if not ADMIN_API_KEY:
+    log.error("CRITICAL: ADMIN_API_KEY not set - admin endpoints disabled")
 ADMIN_SMS_TO       = os.environ.get("ADMIN_PHONE", "")
 _ADMIN_MAX_PER_MIN = 5  # v59: הורדנו מ-10 ל-5
 
 # ─────────────────────────────────────────────
-# v59: Meta Webhook Signature Verification
+# v60.1: Meta Webhook Signature Verification - ללא fallback
 # ─────────────────────────────────────────────
 def _verify_meta_signature(req):
     """
     v59: מאמת חתימת X-Hub-Signature-256 מ-Meta.
-    מחזיר True אם חתימה תקינה או אם APP_SECRET לא הוגדר (fallback).
+    v60.1: הסרת fallback מסוכן - דורש APP_SECRET תמיד.
+    מחזיר True רק אם חתימה תקינה.
     """
     if not WHATSAPP_APP_SECRET:
-        return True  # fallback — לא מומלץ בproduction
+        log.error("signature_verify_failed_no_secret", extra={"ip": req.remote_addr})
+        return False  # v60.1: לא fallback
     sig_header = req.headers.get("X-Hub-Signature-256", "")
     if not sig_header:
         log.warning("signature_missing", extra={"ip": req.remote_addr})
@@ -359,65 +371,68 @@ def is_grounding_positive(text):
     return bool(basic_positive.match(text.strip()))
 
 # ─────────────────────────────────────────────
-# v60: Validation לתרגיל קרקוע
+# v60.1: Validation לתרגיל קרקוע - משופר
 # ─────────────────────────────────────────────
 def validate_grounding_response(text, step):
     """
     v60: בודק אם התשובה מכילה מספר תקין של פריטים לשלב הנוכחי.
+    v60.1: regex במקום לולאות, error handling, הסרת חולשת bypass.
     מחזיר: (is_valid: bool, feedback_msg: str or None)
     """
-    if step >= len(GROUNDING_EXPECTED_COUNTS):
-        # שלב אחרון - "איך התחושה?" - כל תשובה תקינה
+    try:
+        if step >= len(GROUNDING_EXPECTED_COUNTS):
+            # שלב אחרון - "איך התחושה?" - כל תשובה תקינה
+            return True, None
+        
+        expected = GROUNDING_EXPECTED_COUNTS[step]
+        text_clean = text.strip()
+        
+        # ספירת פריטים - ניסיון מס' 1: זיהוי רשימות ממוספרות
+        numbered = re.findall(r'\d+[\.\)]\s*([^\d\n]+)', text_clean)
+        if numbered:
+            items = [item.strip() for item in numbered if len(item.strip()) > 1]
+        else:
+            # ניסיון מס' 2: פיצול לפי מפרידים - v60.1: regex אחד במקום לולאות
+            temp = re.sub(r'[,\n•;\-]|\s+ו\s+', '|', text_clean)
+            items = [item.strip() for item in temp.split('|') if item.strip()]
+            
+            # אם עדיין אין מספיק פריטים - נסה לפצל לפי רווחים
+            if len(items) < expected:
+                words = text_clean.split()
+                # אם יש בערך את מספר המילים הנכון, זה קרוב להיות תקין
+                # (כל פריט = בערך 2 מילים)
+                if len(words) >= expected * 1.5:
+                    items = words  # נחשיב כל מילה כפריט נפרד לצורך הספירה
+            
+            # סינון - השאר רק פריטים באורך סביר (>1 תו)
+            items = [item for item in items if len(item.strip()) > 1]
+        
+        count = len(items)
+        
+        # בדיקה 1: האם יש מספר מספיק של פריטים
+        if count < expected:
+            diff = expected - count
+            feedback_options = [
+                f"נראה שציינת {count} דברים, אבל ביקשתי {expected}. אפשר עוד {diff}? 💙",
+                f"קיבלתי רק {count}, צריך {expected} דברים. תוסיף עוד {diff}? 🌿",
+            ]
+            return False, feedback_options[count % 2]
+        
+        # בדיקה 2: איכות - v60.1: תיקון חולשה - מספר פריטים תקין אבל קצרים מדי
+        # דוגמה לעקיפה: "א, ב, ג, ד, ה" - 5 פריטים אבל חסר משמעות
+        if count >= expected:
+            avg_len = sum(len(item) for item in items[:expected]) / min(len(items), expected)
+            # v60.1: סף מחמיר יותר - ממוצע 3 תווים לפחות (במקום 2)
+            if avg_len < 3:
+                return False, "נראה שהתשובות קצרות מדי. תוכל לתאר יותר? (למשל: 'שולחן חום' במקום 'ש') 🔍"
+        
+        # תשובה תקינה
         return True, None
     
-    expected = GROUNDING_EXPECTED_COUNTS[step]
-    text_clean = text.strip()
-    
-    # ספירת פריטים - ניסיון מס' 1: זיהוי רשימות ממוספרות
-    numbered = re.findall(r'\d+[\.\)]\s*([^\d\n]+)', text_clean)
-    if numbered:
-        items = [item.strip() for item in numbered if len(item.strip()) > 1]
-    else:
-        # ניסיון מס' 2: פיצול לפי מפרידים נפוצים
-        temp = text_clean
-        # החלפת מפרידים במפריד אחיד
-        for separator in [',', '\n', '•', '-', ';', '.']:
-            temp = temp.replace(separator, '|')
-        # פיצול לפי "ו" כמפריד (אבל לא באמצע מילה)
-        temp = re.sub(r'\s+ו\s+', '|', temp)
-        # פיצול ראשוני
-        items = [item.strip() for item in temp.split('|') if item.strip()]
-        
-        # אם עדיין אין מספיק פריטים - נסה לפצל לפי רווחים
-        if len(items) < expected:
-            words = text_clean.split()
-            # אם יש בערך את מספר המילים הנכון, זה קרוב להיות תקין
-            # (כל פריט = בערך 2 מילים)
-            if len(words) >= expected * 1.5:
-                items = words  # נחשיב כל מילה כפריט נפרד לצורך הספירה
-        
-        # סינון - השאר רק פריטים באורך סביר
-        items = [item for item in items if len(item.strip()) > 1]
-    
-    count = len(items)
-    
-    # בדיקה 1: האם יש מספר מספיק של פריטים
-    if count < expected:
-        diff = expected - count
-        feedback_options = [
-            f"נראה שציינת {count} דברים, אבל ביקשתי {expected}. אפשר עוד {diff}? 💙",
-            f"קיבלתי רק {count}, צריך {expected} דברים. תוסיף עוד {diff}? 🌿",
-        ]
-        return False, feedback_options[count % 2]
-    
-    # בדיקה 2: בדיקת איכות - פריטים לא יכולים להיות קצרים מדי
-    avg_len = sum(len(item) for item in items) / len(items) if items else 0
-    if avg_len < 2 and count >= expected:
-        # רק אם המשתמש נתן את המספר הנכון אבל התשובות קצרות מדי (כמו "א ב ג ד ה")
-        return False, "נראה שהתשובות קצרות מדי. תוכל לתאר יותר? (למשל: 'שולחן חום' במקום 'ש') 🔍"
-    
-    # תשובה תקינה
-    return True, None
+    except Exception as e:
+        log.error("validation_error", extra={"err": str(e), "step": step})
+        # במקרה של שגיאה - נותנים לעבור (fail-safe)
+        return True, None
 
 # ─────────────────────────────────────────────
 # זיהוי משבר — ללא שינוי
@@ -680,7 +695,7 @@ def send_logo(to):
                       "to": to, "type": "image", "image": {"link": LOGO_URL}})
 
 # ─────────────────────────────────────────────
-# State
+# State - v60.1: הוספת grounding_retry
 # ─────────────────────────────────────────────
 STATE_KEY_PREFIX = "sh:state:"
 SEEN_MSG_TTL_SEC = 120
@@ -695,6 +710,7 @@ _STATE_DEFAULTS = {
     "grounding_session": 0,
     "sad_count":         0,
     "breathing_active":  False,
+    "grounding_retry":   0,  # v60.1: מונה ניסיונות תשובה
 }
 
 def _default_state():
@@ -845,7 +861,7 @@ def _send_logo_and_welcome(phone, now):
     _enqueue(nudge_after_welcome, phone, now)
 
 # ─────────────────────────────────────────────
-# לוגיקה מרכזית — ללא שינוי בתרגילים
+# לוגיקה מרכזית - v60.1: atomic retry + הסרת PII מלוגים
 # ─────────────────────────────────────────────
 def handle_message(phone, text):
     with _get_phone_lock(phone):
@@ -859,7 +875,7 @@ def _handle_message_inner(phone, text):
     # 1. משבר
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
-        set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
+        set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False, grounding_retry=0)
         _br_clear(phone)
         send_message(phone, MSG_CRISIS)
         return
@@ -877,8 +893,8 @@ def _handle_message_inner(phone, text):
 
     # 4. injection
     if guardian_check_input(text):
-        log.warning("injection_attempt", extra={"phone": phone, "text": text[:80]})
-        set_state(phone, tool="none", step=0, breathing_active=False)
+        log.warning("injection_attempt", extra={"phone": phone})  # v60.1: הסרת text מהלוג
+        set_state(phone, tool="none", step=0, breathing_active=False, grounding_retry=0)
         _br_clear(phone)
         send_message(phone, MSG_OFF_TOPIC)
         return
@@ -898,7 +914,7 @@ def _handle_message_inner(phone, text):
         set_state(phone, sad_count=new_sad)
         if new_sad >= 3:
             log.info("escalation_crisis", extra={"phone": phone, "sad_count": new_sad})
-            set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
+            set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False, grounding_retry=0)
             _br_clear(phone)
             send_message(phone, MSG_CRISIS)
             return
@@ -928,7 +944,7 @@ def _handle_message_inner(phone, text):
                 return
         return
 
-    # ── 8. קרקוע פעיל ──
+    # ── 8. קרקוע פעיל - v60.1: atomic retry counter ──
     if tool == "grounding":
         gs = s["grounding_session"]
         if t in GROUNDING_RESET_WORDS:
@@ -943,9 +959,15 @@ def _handle_message_inner(phone, text):
         is_valid, feedback = validate_grounding_response(text, step)
         
         if not is_valid:
-            # תשובה לא תקינה - ספירת ניסיונות
-            retry_count = s.get("grounding_retry", 0) + 1
-            set_state(phone, grounding_retry=retry_count)
+            # v60.1: atomic increment למניעת race condition
+            try:
+                key = STATE_KEY_PREFIX + phone
+                retry_count = _redis.hincrby(key, "grounding_retry", 1)
+                _redis.expire(key, STATE_TTL_SEC)
+            except Exception as e:
+                log.error("retry_increment_error", extra={"phone": phone, "err": str(e)})
+                retry_count = s.get("grounding_retry", 0) + 1
+                set_state(phone, grounding_retry=retry_count)
             
             if retry_count >= GROUNDING_MAX_RETRIES:
                 # אחרי מספר ניסיונות מקסימלי - נותנים לעבור הלאה
@@ -955,9 +977,9 @@ def _handle_message_inner(phone, text):
             else:
                 # תן feedback ונשאר באותו שלב
                 send_message(phone, feedback)
-                log.info("grounding_validation_failed", extra={
-                    "phone": phone, "step": step, "retry": retry_count, "text": text[:50]
-                })
+                log.info("grounding_validation_retry", extra={
+                    "phone": phone, "step": step, "retry": retry_count
+                })  # v60.1: הסרת text מהלוג
                 return  # נשאר באותו שלב
         
         # תשובה תקינה או עברו מספר ניסיונות מקסימלי - איפוס מונה
@@ -975,7 +997,7 @@ def _handle_message_inner(phone, text):
             return
         new_gs    = gs + 1
         next_step = step + 1
-        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs)
+        set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
         send_message(phone, GROUNDING_STEPS[next_step])
         _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
         return
@@ -989,7 +1011,7 @@ def _handle_message_inner(phone, text):
     # ── 10. בחירת קרקוע ──
     if text == "ב" or t == "b":
         new_gs = s["grounding_session"] + 1
-        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs)
+        set_state(phone, tool="grounding", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0)
         send_message(phone, GROUNDING_STEPS[0])
         _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
@@ -1135,7 +1157,7 @@ def admin_add_blacklist(phone):
     return jsonify({"status": "blacklisted", "phone": phone}), 200
 
 # ─────────────────────────────────────────────
-# Webhook — v59: signature verification
+# Webhook — v60.1: signature verification (ללא fallback)
 # ─────────────────────────────────────────────
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -1148,7 +1170,7 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def receive_message():
-    # v59: אימות חתימת Meta
+    # v60.1: אימות חתימת Meta - ללא fallback
     if not _verify_meta_signature(request):
         log.warning("webhook_signature_rejected", extra={"ip": request.remote_addr})
         return jsonify({"error": "invalid signature"}), 403
@@ -1185,7 +1207,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v59",
+        "version": "v60.1",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -1193,7 +1215,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v59", 200
+    return "SafeHarbor Bot is running v60.1", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
