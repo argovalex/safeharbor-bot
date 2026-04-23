@@ -1,9 +1,9 @@
-# SafeHarbor Bot v60.8
-# שינויים עיקריים:
+# SafeHarbor Bot v60.9
+# שינויים:
+#   - v60.9: תיקון קריטי - בדיקת שלב אחרון לפני validation (שלב 5 עובר ללא בדיקה)
 #   - v60.8: עצירה באמצע תרגיל קרקוע (stop/עצור/די → MSG_GROUNDING_POSITIVE)  
 #   - v60.8: 3 שניות המתנה אחרי BREATHING_START לפני תחילת תרגיל הנשימה
 #   - v60.1: validation מלא לקרקוע - ספירת פריטים [5,4,3,2,1] + retry עם feedback
-#   - v60.1: תיקוני אבטחה קריטיים (signature verification, atomic retry, PII removal)
 
 import os, time, json, logging, threading, hmac, hashlib
 import requests as http_requests
@@ -937,7 +937,6 @@ def _handle_message_inner(phone, text):
         # v60.8: עצירה באמצע תרגיל
         if t in GROUNDING_RESET_WORDS:
             set_state(phone, tool="none", step=0, wait_count=0, grounding_session=gs + 1, grounding_retry=0)
-            # אם השתמש במילות עצירה חיוביות - הודעת סיום חיובית
             if t in {"עצור", "stop", "די"} and step > 0:
                 send_message(phone, MSG_GROUNDING_POSITIVE)
             else:
@@ -947,11 +946,22 @@ def _handle_message_inner(phone, text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(hint=GROUNDING_HINTS[min(step, len(GROUNDING_HINTS)-1)]))
             return
         
-        # v60: Validation - בדיקת תקינות התשובה
+        # v60.9: בדיקת שלב אחרון לפני validation
+        if step == len(GROUNDING_STEPS) - 1:
+            new_gs = gs + 1
+            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=new_gs, grounding_retry=0)
+            if is_grounding_positive(text):
+                log.info("grounding_positive", extra={"phone": phone})
+                send_message(phone, MSG_GROUNDING_POSITIVE)
+            else:
+                log.info("grounding_negative_or_hesitant", extra={"phone": phone})
+                send_message(phone, MSG_RETURNING)
+            return
+        
+        # v60: Validation - בדיקת תקינות התשובה (רק שלבים 0-4)
         is_valid, feedback = validate_grounding_response(text, step)
         
         if not is_valid:
-            # v60.1: atomic increment למניעת race condition
             try:
                 key = STATE_KEY_PREFIX + phone
                 retry_count = _redis.hincrby(key, "grounding_retry", 1)
@@ -962,10 +972,7 @@ def _handle_message_inner(phone, text):
                 set_state(phone, grounding_retry=retry_count)
             
             if retry_count >= GROUNDING_MAX_RETRIES:
-                # אחרי מספר ניסיונות מקסימלי - נותנים לעבור הלאה
                 send_message(phone, "בסדר, בואו נמשיך הלאה 💙")
-                set_state(phone, grounding_retry=0)
-                # v60.8: מעבר מפורש לשלב הבא
                 new_gs = gs + 1
                 next_step = step + 1
                 set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
@@ -973,27 +980,13 @@ def _handle_message_inner(phone, text):
                 _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
                 return
             else:
-                # תן feedback ונשאר באותו שלב
                 send_message(phone, feedback)
-                log.info("grounding_validation_retry", extra={
-                    "phone": phone, "step": step, "retry": retry_count
-                })  # v60.1: הסרת text מהלוג
-                return  # נשאר באותו שלב
+                log.info("grounding_validation_retry", extra={"phone": phone, "step": step, "retry": retry_count})
+                return
         
-        # תשובה תקינה או עברו מספר ניסיונות מקסימלי - איפוס מונה
+        # תשובה תקינה - מעבר לשלב הבא
         set_state(phone, grounding_retry=0)
-        
-        if step == len(GROUNDING_STEPS) - 1:
-            new_gs = gs + 1
-            set_state(phone, tool="none", step=0, wait_count=0, grounding_session=new_gs)
-            if is_grounding_positive(text):
-                log.info("grounding_positive", extra={"phone": phone})
-                send_message(phone, MSG_GROUNDING_POSITIVE)
-            else:
-                log.info("grounding_negative_or_hesitant", extra={"phone": phone})
-                send_message(phone, MSG_RETURNING)
-            return
-        new_gs    = gs + 1
+        new_gs = gs + 1
         next_step = step + 1
         set_state(phone, step=next_step, wait_count=0, grounding_session=new_gs, grounding_retry=0)
         send_message(phone, GROUNDING_STEPS[next_step])
