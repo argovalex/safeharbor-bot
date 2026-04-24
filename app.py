@@ -1,18 +1,8 @@
-# SafeHarbor Bot v61
-# שינויים מ-v59:
-#   - v61: כפתורי WhatsApp Interactive לתרגיל קרקוע (send_button_message)
-#   - v61: GROUNDING_STEPS כ-tuples (טקסט, label_כפתור)
-#   - v61: GROUNDING_MAX_RETRIES + grounding_retry בstate
-#   - v61: ולידציה + retry במהלך קרקוע
-#   - v61: webhook תומך ב-msg_type interactive
-#   - v59: הוספת _verify_meta_signature
-#   - v59: הסרת ADMIN_API_KEY מ-JavaScript בדשבורד
-#   - v59: audit log לכל פעולת admin
-#   - v59: rate limit חזק יותר על admin routes (5/דקה במקום 10)
-#   - v59: שיפור is_grounding_positive לתשובות מעורבות
-#   - v59: cleanup תקופתי ל-Redis metrics
-#   - v59: STATE_TTL מוגדר ל-30 יום
-#   - v59: הרחבת DELETE_DATA_WORDS
+# SafeHarbor Bot v62
+# שינויים מ-v61:
+#   - v62: זיהוי אידאציה פסיבית (_PASSIVE_IDEATION_RE) — ביטויים עקיפים שלא נתפסו ב-_CRISIS_WORDS
+#   - v62: מודל הסלמה 3 שכבות: CRISIS (מיידי) → PASSIVE (בירור עדין) → SAD (ספירה)
+#   - v62: MSG_SOFT_CHECK — תגובת ביניים לאידאציה פסיבית לפני הפנייה לשירותי משבר
 
 import os, time, json, logging, threading, hmac, hashlib
 import requests as http_requests
@@ -212,6 +202,16 @@ MSG_CRISIS = (
     '\u260e\ufe0f נט"ל: 1-800-363-363'
 )
 
+MSG_SOFT_CHECK = (
+    'אני שומע אותך, ומה שאתה אומר חשוב. \U0001f499\n\n'
+    'רציתי לשאול ישירות — האם יש לך מחשבות לפגוע בעצמך?\n\n'
+    'אם כן, אנא פנה עכשיו אל:\n'
+    '\u260e\ufe0f ער"ן: 1201\n'
+    '\U0001f4ac https://wa.me/972528451201\n'
+    '\U0001f4ac סה"ר: https://wa.me/972543225656\n\n'
+    'אם תרצה, אני כאן ויכולים לנסות תרגיל הרגעה יחד.'
+)
+
 MSG_OFF_TOPIC = (
     'אני כאן כדי לעזור לך להתייצב. \u2693\n\n'
     'הקש *א* לתרגיל נשימה \U0001f32c\ufe0f\n'
@@ -403,6 +403,50 @@ _crisis_re = re.compile("|".join(re.escape(w) for w in _CRISIS_WORDS), re.IGNORE
 def is_crisis(text):
     return bool(_crisis_re.search(_normalize_text(text)))
 
+# ─────────────────────────────────────────────
+# v62: זיהוי אידאציה פסיבית — ביטויים עקיפים
+# ─────────────────────────────────────────────
+_PASSIVE_IDEATION_RE = re.compile(
+    # רצון להיעלם / לחדול מלהיות
+    r"(רוצה|רציתי|הייתי\s+רוצה)\s+(להיעלם|שלא\s+אהיה|שלא\s+הייתי\s+כאן|שלא\s+אהיה\s+כאן)"
+    r"|לא\s+להיות\s+כאן"
+    r"|לישון\s+(ולא\s+לקום|ולא\s+להתעורר|הרבה\s+זמן|לנצח)"
+    # עומס על אחרים / ניכור
+    r"|(כולם|הם|כולכם)\s+(יהיו|יסתדרו|יסתדר)\s+(בסדר\s+)?(בלעדיי|ללא|מבלי)"
+    r"|אני\s+(מכביד|מכבידה|עומס|מעמסה|נטל)\s+(על|עבור)"
+    r"|עדיף\s+(בלעדיי|ללא|שלא\s+הייתי)"
+    r"|מי\s+(בכלל\s+)?(יתגעגע|יזכור|שם\s+לב)\s+(אלי|לי)"
+    r"|אף\s+אחד\s+לא\s+(יתגעגע|ידאג|יזכור|יחסר\s+לו)"
+    # פרידה / סיום
+    r"|ר?צ?יתי\s+להגיד\s+(שלום|להתפרד|פרידה)"
+    r"|זו\s+(הפעם\s+)?האחרונה\s+(שאדבר|שאכתוב|שאפנה)"
+    r"|תודה\s+(לך\s+)?על\s+הכל"
+    r"|(לא|לא\s+אהיה)\s+בסביבה\s+(הרבה\s+)?יותר\s+זמן"
+    r"|(לא\s+אהיה|לא\s+אהיה\s+כאן)\s+(הרבה\s+)?יותר\s+זמן"
+    # כניעה / ייאוש עמוק
+    r"|נמאס\s+לי\s+להילחם"
+    r"|אין\s+לי\s+כוח\s+(להמשיך|להתמודד|ללחום|לחיות)"
+    r"|לא\s+יכול\s+להמשיך\s+(ככה|כך|כבר)"
+    r"|מוותר\s+(על\s+הכל|לגמרי)"
+    r"|עייף\s+(כל\s+כך|מדי)\s+(מ|מ.+)(חיים|הכל|הכאב|הסבל)"
+    # שקט פתאומי / נחת לאחר תקופת סבל
+    r"|סוף\s+סוף\s+(שקט|נח|שלוה|שלום)"
+    r"|מרגיש\s+(שלוה|שקט|נחת)\s+(פתאום|לפתע|אחרי)"
+    # English equivalents
+    r"|just\s+want\s+to\s+(disappear|not\s+exist|stop\s+existing|vanish)"
+    r"|better\s+off\s+without\s+me"
+    r"|no\s+one\s+(would|will)\s+(miss|notice|care)"
+    r"|(won.t|will\s+not)\s+be\s+(around|here)\s+(much\s+longer|anymore)"
+    r"|tired\s+of\s+(being\s+here|everything|the\s+pain|fighting\s+every\s+day)"
+    r"|finally\s+(at\s+peace|feel\s+calm|ready)"
+    r"|wanted\s+to\s+say\s+(goodbye|my\s+last)",
+    re.IGNORECASE
+)
+
+def is_passive_ideation(text):
+    """v62: זיהוי ביטויים עקיפים של מחשבות אובדניות שלא נכללים ב-_CRISIS_WORDS."""
+    return bool(_PASSIVE_IDEATION_RE.search(_normalize_text(text)))
+
 _SAD_WORDS_RE = re.compile(
     r"עצוב|עצובה|כואב|כואבת|לא יכול|לא יכולה|קשה לי|בוכה|מפחד|מפחדת|"
     r"לבד|לבדי|אין לי|אף אחד|דיכאון|חרדה|פחד|בהלה|פאניקה|"
@@ -467,7 +511,7 @@ _ALLOWED_OUTGOING = set()
 
 def _build_allowed_outgoing():
     for msg in [MSG_WELCOME, MSG_RETURNING, MSG_NUDGE, MSG_WELCOME_NUDGE,
-                MSG_CRISIS, MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET,
+                MSG_CRISIS, MSG_SOFT_CHECK, MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET,
                 BREATHING_START, GROUNDING_NUDGE_1, GROUNDING_NUDGE_2,
                 MSG_BREATHING_WAIT_CONFIRM, MSG_GROUNDING_POSITIVE,
                 # v61: הודעות retry קרקוע
@@ -828,7 +872,7 @@ def _handle_message_inner(phone, text, msg_type="text"):
     text = _clean_text(text)
     t    = text.lower()
 
-    # 1. משבר
+    # 1. שכבה א' — משבר מפורש (מיידי → MSG_CRISIS)
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
         set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
@@ -864,7 +908,15 @@ def _handle_message_inner(phone, text, msg_type="text"):
     tool = s["tool"]
     step = s["step"]
 
-    # 5. escalation
+    # 5. שכבה ב' — אידאציה פסיבית (v62: בירור עדין → MSG_SOFT_CHECK)
+    if is_passive_ideation(text):
+        log.info("passive_ideation_detected", extra={"phone": phone})
+        set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
+        _br_clear(phone)
+        send_message(phone, MSG_SOFT_CHECK)
+        return
+
+    # 6. שכבה ג' — אותות עצב (ספירה → MSG_CRISIS לאחר 3)
     if has_sad_signal(text):
         new_sad = s.get("sad_count", 0) + 1
         set_state(phone, sad_count=new_sad)
@@ -1193,7 +1245,7 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v61",
+        "version": "v62",
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
@@ -1201,7 +1253,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v61", 200
+    return "SafeHarbor Bot is running v62", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
