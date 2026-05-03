@@ -1,15 +1,19 @@
-# SafeHarbor Bot v62
-# שינויים מ-v61:
-#   - v62: זיהוי אידאציה פסיבית (_PASSIVE_IDEATION_RE) — ביטויים עקיפים שלא נתפסו ב-_CRISIS_WORDS
-#   - v62: מודל הסלמה 3 שכבות: CRISIS (מיידי) → PASSIVE (בירור עדין) → SAD (ספירה)
-#   - v62: MSG_SOFT_CHECK — תגובת ביניים לאידאציה פסיבית לפני הפנייה לשירותי משבר
+# SafeHarbor Bot v63
+# בוט תמיכה רגשית בעברית בוואטסאפ
+# - תרגילי נשימה (5-5-5-5, 3 סבבים)
+# - תרגילי קרקוע (5-4-3-2-1)
+# - זיהוי משבר 3 שכבות: CRISIS / PASSIVE / SAD
+# - דף /stats מוגן בסיסמה עם סטטיסטיקות שימוש
 
-import os, time, json, logging, threading, hmac, hashlib
+import os, time, json, logging, threading, hmac, hashlib, secrets
 import requests as http_requests
 import re
 import redis as redis_lib
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response, redirect
 
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
 class _JsonFmt(logging.Formatter):
     def format(self, r):
         d = {"ts": self.formatTime(r, "%Y-%m-%dT%H:%M:%S"), "level": r.levelname, "msg": r.getMessage()}
@@ -21,6 +25,9 @@ _h.setFormatter(_JsonFmt())
 logging.basicConfig(handlers=[_h], level=logging.INFO, force=True)
 log = logging.getLogger("safeharbor")
 
+# ─────────────────────────────────────────────
+# Sentry (אופציונלי)
+# ─────────────────────────────────────────────
 _SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
 if _SENTRY_DSN:
     try:
@@ -30,20 +37,31 @@ if _SENTRY_DSN:
     except ImportError:
         log.warning("sentry_sdk_not_installed")
 
+# ─────────────────────────────────────────────
+# הגדרות בסיסיות
+# ─────────────────────────────────────────────
 app         = Flask(__name__)
 _START_TIME = time.time()
+VERSION     = "v63"
 
-WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
-VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
-WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")  # v59: לחתימת Meta
-WHATSAPP_API_URL  = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
-DEBOUNCE_SEC      = 1.0
+WHATSAPP_TOKEN      = os.environ.get("WHATSAPP_TOKEN", "")
+WHATSAPP_PHONE_ID   = os.environ.get("WHATSAPP_PHONE_ID", "")
+VERIFY_TOKEN        = os.environ.get("VERIFY_TOKEN", "")
+WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
+WHATSAPP_API_URL    = "https://graph.facebook.com/v22.0/{}/messages".format(WHATSAPP_PHONE_ID)
+DEBOUNCE_SEC        = 1.0
+
+ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
+ADMIN_SMS_TO       = os.environ.get("ADMIN_PHONE", "")
+STATS_PASSWORD     = os.environ.get("STATS_PASSWORD", "")  # סיסמה לדף /stats
+_ADMIN_MAX_PER_MIN = 5
 
 if not VERIFY_TOKEN:
     log.warning("security_warning: VERIFY_TOKEN not set")
 if not WHATSAPP_APP_SECRET:
     log.warning("security_warning: WHATSAPP_APP_SECRET not set — signature verification disabled")
+if not STATS_PASSWORD:
+    log.warning("security_warning: STATS_PASSWORD not set — stats page disabled")
 
 LOGO_URL = os.environ.get("LOGO_URL", "https://raw.githubusercontent.com/argovalex/safeharbor-bot/main/logo.png")
 
@@ -52,6 +70,9 @@ _WA_HEADERS = {
     "Content-Type":  "application/json",
 }
 
+# ─────────────────────────────────────────────
+# Redis
+# ─────────────────────────────────────────────
 _redis = redis_lib.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True,
@@ -62,6 +83,9 @@ _redis = redis_lib.from_url(
     max_connections=20,
 )
 
+# ─────────────────────────────────────────────
+# Queue
+# ─────────────────────────────────────────────
 from concurrent.futures import ThreadPoolExecutor as _TPE
 _msg_executor = _TPE(max_workers=30)
 
@@ -80,25 +104,94 @@ def _enqueue(fn, *args):
     else:
         _msg_executor.submit(fn, *args)
 
-ADMIN_API_KEY      = os.environ.get("ADMIN_API_KEY", "safeharbor-secret")
-ADMIN_SMS_TO       = os.environ.get("ADMIN_PHONE", "")
-_ADMIN_MAX_PER_MIN = 5  # v59: הורדנו מ-10 ל-5
+# ─────────────────────────────────────────────
+# מעקב סטטיסטיקות (Redis counters יומיים)
+# מבנה: sh:stats:{metric}:{YYYY-MM-DD} → counter
+#       sh:stats:users:{YYYY-MM-DD} → SET של מספרי טלפון
+# ─────────────────────────────────────────────
+STATS_TTL = 60 * 24 * 3600  # 60 יום שמירה
+
+def _stats_today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+def _stats_inc(metric, amount=1):
+    """מעלה counter של מטריקה ביום הנוכחי."""
+    try:
+        key = "sh:stats:{}:{}".format(metric, _stats_today())
+        _redis.incrby(key, amount)
+        _redis.expire(key, STATS_TTL)
+    except Exception as e:
+        log.error("stats_inc_error", extra={"metric": metric, "err": str(e)})
+
+def _stats_track_user(phone):
+    """מסמן משתמש כפעיל היום (SET ייחודי)."""
+    try:
+        key = "sh:stats:users:{}".format(_stats_today())
+        _redis.sadd(key, phone)
+        _redis.expire(key, STATS_TTL)
+    except Exception as e:
+        log.error("stats_user_error", extra={"err": str(e)})
+
+def _stats_collect(days):
+    """אוסף סטטיסטיקות לטווח של N ימים אחורה (כולל היום)."""
+    metrics = ["messages_in", "messages_out", "breathing_started",
+               "grounding_started", "crisis_detected", "passive_ideation",
+               "injection_blocked", "rate_limited"]
+    result = {m: 0 for m in metrics}
+    unique_users = set()
+
+    now = time.time()
+    for d in range(days):
+        date = time.strftime("%Y-%m-%d", time.gmtime(now - d * 86400))
+        for m in metrics:
+            try:
+                v = _redis.get("sh:stats:{}:{}".format(m, date))
+                if v:
+                    result[m] += int(v)
+            except Exception:
+                pass
+        try:
+            users = _redis.smembers("sh:stats:users:{}".format(date))
+            unique_users.update(users)
+        except Exception:
+            pass
+
+    result["unique_users"] = len(unique_users)
+    return result
+
+def _stats_collect_all():
+    """אוסף את כל הסטטיסטיקות מאז התקנה (סורק SCAN)."""
+    metrics = ["messages_in", "messages_out", "breathing_started",
+               "grounding_started", "crisis_detected", "passive_ideation",
+               "injection_blocked", "rate_limited"]
+    result = {m: 0 for m in metrics}
+    unique_users = set()
+
+    try:
+        for m in metrics:
+            for key in _redis.scan_iter("sh:stats:{}:*".format(m)):
+                v = _redis.get(key)
+                if v:
+                    result[m] += int(v)
+        for key in _redis.scan_iter("sh:stats:users:*"):
+            users = _redis.smembers(key)
+            unique_users.update(users)
+    except Exception as e:
+        log.error("stats_collect_error", extra={"err": str(e)})
+
+    result["unique_users"] = len(unique_users)
+    return result
 
 # ─────────────────────────────────────────────
-# v59: Meta Webhook Signature Verification
+# אימות חתימת Meta
 # ─────────────────────────────────────────────
 def _verify_meta_signature(req):
-    """
-    v59: מאמת חתימת X-Hub-Signature-256 מ-Meta.
-    מחזיר True אם חתימה תקינה או אם APP_SECRET לא הוגדר (fallback).
-    """
     if not WHATSAPP_APP_SECRET:
-        return True  # fallback — לא מומלץ בproduction
+        return True
     sig_header = req.headers.get("X-Hub-Signature-256", "")
     if not sig_header:
         log.warning("signature_missing", extra={"ip": req.remote_addr})
         return False
-    # הסרת prefix sha256=
     if sig_header.startswith("sha256="):
         sig_header = sig_header[7:]
     try:
@@ -120,7 +213,7 @@ def _verify_meta_signature(req):
         return False
 
 # ─────────────────────────────────────────────
-# v59: Admin rate limit
+# Admin: rate limit + audit
 # ─────────────────────────────────────────────
 def _admin_rate_ok(ip):
     now = time.time()
@@ -136,11 +229,7 @@ def _admin_rate_ok(ip):
     except Exception:
         return True
 
-# ─────────────────────────────────────────────
-# v59: Admin audit log
-# ─────────────────────────────────────────────
 def _admin_audit(action, ip, phone=None, extra=None):
-    """v59: רושם כל פעולת admin ל-log."""
     log.info("admin_audit", extra={
         "action": action,
         "ip":     ip,
@@ -149,18 +238,15 @@ def _admin_audit(action, ip, phone=None, extra=None):
         "ts":     time.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
-# ─────────────────────────────────────────────
-# v59: check admin key עם audit
-# ─────────────────────────────────────────────
 def _check_admin_key(req):
     ip     = req.remote_addr or "unknown"
     result = req.headers.get("X-Admin-Key") == ADMIN_API_KEY
     if not result:
-        log.warning("admin_auth_failed", extra={"ip": ip})  # v59: audit על כשל
+        log.warning("admin_auth_failed", extra={"ip": ip})
     return result
 
 # ─────────────────────────────────────────────
-# הודעות — ללא שינוי
+# הודעות בוט
 # ─────────────────────────────────────────────
 _DISCLAIMER = '\n\n_אני בוט עזר ראשוני בלבד. אינני תחליף לייעוץ, טיפול או שירות מקצועי._'
 
@@ -235,7 +321,7 @@ MSG_RESET                  = "בסדר, אני כאן כשתצטרך. \U0001f30a
 BREATHING_START            = "אני כאן איתך בוא נספור יחד. \U0001f32c\ufe0f"
 
 # ─────────────────────────────────────────────
-# תרגיל נשימה — ללא שינוי
+# תרגיל נשימה
 # ─────────────────────────────────────────────
 BREATHING_PARTS = [
     "\u2B05\ufe0f שאיפה איטית... 21-22-23-24-25",
@@ -254,10 +340,8 @@ BREATHING_PARTS = [
 ]
 
 # ─────────────────────────────────────────────
-# תרגיל קרקוע — ללא שינוי
+# תרגיל קרקוע — (טקסט, תווית כפתור או None לשלב אחרון)
 # ─────────────────────────────────────────────
-# v61: tuples של (טקסט_שלב, label_כפתור_או_None)
-# None = שלב אחרון, לא צריך כפתור התקדמות
 GROUNDING_STEPS = [
     ("\U0001f440 בוא נתמקד ברגע הזה. ציין 5 דברים שאתה רואה סביבך כרגע.", "ראיתי 5 דברים"),
     ("\U0001f91a מצוין. עכשיו, 4 דברים שאתה יכול לגעת בהם כרגע.", "מצאתי 4 דברים"),
@@ -267,15 +351,14 @@ GROUNDING_STEPS = [
     ("\U0001f499 איך התחושה עכשיו?", None),
 ]
 
-GROUNDING_MAX_RETRIES = 2  # v61: מקסימום ניסיונות לפני מעבר אוטומטי
-
-GROUNDING_NUDGE_1    = "\U0001f499 אני כאן איתך. מצאת משהו אחד?"
-GROUNDING_NUDGE_2    = "\u23f3 נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן."
-GROUNDING_CHAT_REPLY = "אני כאן רק כדי לעזור לך להתייצב. נסה לציין דברים שאתה {hint} כרגע."
-GROUNDING_HINTS      = ["רואה", "יכול לגעת בהם", "שומע", "מריח", "יכול לטעום", "מרגיש"]
+GROUNDING_MAX_RETRIES = 2
+GROUNDING_NUDGE_1     = "\U0001f499 אני כאן איתך. מצאת משהו אחד?"
+GROUNDING_NUDGE_2     = "\u23f3 נראה שאתה צריך יותר זמן. אני כאן כשתהיה מוכן."
+GROUNDING_CHAT_REPLY  = "אני כאן רק כדי לעזור לך להתייצב. נסה לציין דברים שאתה {hint} כרגע."
+GROUNDING_HINTS       = ["רואה", "יכול לגעת בהם", "שומע", "מריח", "יכול לטעום", "מרגיש"]
 
 # ─────────────────────────────────────────────
-# מילות מפתח — ללא שינוי
+# מילות מפתח
 # ─────────────────────────────────────────────
 BREATHING_YES_WORDS = {
     "כן", "כ", "כן כן", "בטח", "אוקיי", "אוקי", "טוב", "סבבה", "נו",
@@ -288,7 +371,6 @@ BREATHING_STOP_WORDS  = {"לא", "ל", "no", "n", "די", "stop", "done", "סי�
 GREET_WORDS           = {"שלום", "היי", "הי", "hello", "hi", "hey", "חזרתי"}
 GROUNDING_RESET_WORDS = {"חזור", "איפוס", "reset", "back", "stop", "די"}
 
-# v59: הרחבת DELETE_DATA_WORDS
 DELETE_DATA_WORDS = {
     "מחק", "מחקי", "מחק אותי", "מחק את הנתונים", "מחק נתונים",
     "תמחק", "תמחקי", "תמחק אותי", "תמחק את הנתונים",
@@ -296,15 +378,6 @@ DELETE_DATA_WORDS = {
     "הסר אותי", "הסר", "הסירי",
     "delete", "delete me", "delete my data", "forget me", "remove me",
     "erase", "erase me", "clear my data",
-}
-
-GROUNDING_POSITIVE_WORDS = {
-    "טוב", "טובה", "בסדר", "יותר טוב", "הרגשתי טוב", "הרגשתי טובה",
-    "עזר", "עזרה", "עזר לי", "עזרה לי", "הרגשתי רגוע", "הרגשתי רגועה",
-    "רגוע", "רגועה", "שקט", "שקטה", "נרגעתי", "יפה", "מצוין", "מעולה",
-    "ממש טוב", "הרבה יותר טוב", "קצת יותר טוב", "סבבה", "אחלה",
-    "good", "better", "great", "calm", "calmer", "relaxed", "nice", "fine",
-    "much better", "a bit better", "helped", "it helped",
 }
 
 # ─────────────────────────────────────────────
@@ -328,8 +401,7 @@ def _normalize_text(text):
     return text
 
 # ─────────────────────────────────────────────
-# v59: is_grounding_positive משופר
-# תומך בתשובות מעורבות: "עזר קצת אבל עדיין קשה" → שלילי
+# זיהוי תגובות חיוביות/שליליות בקרקוע
 # ─────────────────────────────────────────────
 _GROUNDING_POSITIVE_RE = re.compile(
     r"טוב|טובה|בסדר|יותר טוב|עזר|נרגע|רגוע|רגועה|שקט|שקטה|מצוין|מעולה|יפה|סבבה|אחלה|"
@@ -339,29 +411,23 @@ _GROUNDING_POSITIVE_RE = re.compile(
 
 _GROUNDING_NEGATIVE_RE = re.compile(
     r"לא טוב|לא בסדר|עדיין|קשה|כבד|לא עזר|לא עזרה|לא הרגשתי|לא השתנה|"
-    r"אבל.*?(קשה|כבד|עדיין)|קצת.*?(קשה|כבד)|"  # v59: תשובות מעורבות
+    r"אבל.*?(קשה|כבד|עדיין)|קצת.*?(קשה|כבד)|"
     r"not good|not better|still|hard|heavy|didn.t help|no change|"
     r"but.*(hard|heavy|still)|a bit.*(hard|heavy)",
     re.IGNORECASE
 )
 
 def is_grounding_positive(text):
-    """
-    v59: זיהוי משופר.
-    שלילי מנצח תמיד.
-    תשובות מעורבות ("עזר קצת אבל עדיין קשה") → שלילי.
-    ספק → שלילי (בטוח יותר לבריאות הנפש).
-    """
+    """שלילי מנצח. ספק → שלילי (בטוח לבריאות הנפש)."""
     if _GROUNDING_NEGATIVE_RE.search(text):
         return False
     if _GROUNDING_POSITIVE_RE.search(text):
         return True
-    # v59: fallback — מילה חיובית בסיסית אחת מספיקה
     basic_positive = re.compile(r"^(טוב|בסדר|ok|okay|fine|good|כן)$", re.IGNORECASE)
     return bool(basic_positive.match(text.strip()))
 
 # ─────────────────────────────────────────────
-# זיהוי משבר — ללא שינוי
+# שכבה א' — זיהוי משבר מפורש
 # ─────────────────────────────────────────────
 _CRISIS_WORDS = [
     "להתאבד", "לסיים הכל", "להיעלם", "רוצה למות", "בא לי למות",
@@ -404,35 +470,29 @@ def is_crisis(text):
     return bool(_crisis_re.search(_normalize_text(text)))
 
 # ─────────────────────────────────────────────
-# v62: זיהוי אידאציה פסיבית — ביטויים עקיפים
+# שכבה ב' — אידאציה פסיבית (ביטויים עקיפים)
 # ─────────────────────────────────────────────
 _PASSIVE_IDEATION_RE = re.compile(
-    # רצון להיעלם / לחדול מלהיות
     r"(רוצה|רציתי|הייתי\s+רוצה)\s+(להיעלם|שלא\s+אהיה|שלא\s+הייתי\s+כאן|שלא\s+אהיה\s+כאן)"
     r"|לא\s+להיות\s+כאן"
     r"|לישון\s+(ולא\s+לקום|ולא\s+להתעורר|הרבה\s+זמן|לנצח)"
-    # עומס על אחרים / ניכור
     r"|(כולם|הם|כולכם)\s+(יהיו|יסתדרו|יסתדר)\s+(בסדר\s+)?(בלעדיי|ללא|מבלי)"
     r"|אני\s+(מכביד|מכבידה|עומס|מעמסה|נטל)\s+(על|עבור)"
     r"|עדיף\s+(בלעדיי|ללא|שלא\s+הייתי)"
     r"|מי\s+(בכלל\s+)?(יתגעגע|יזכור|שם\s+לב)\s+(אלי|לי)"
     r"|אף\s+אחד\s+לא\s+(יתגעגע|ידאג|יזכור|יחסר\s+לו)"
-    # פרידה / סיום
     r"|ר?צ?יתי\s+להגיד\s+(שלום|להתפרד|פרידה)"
     r"|זו\s+(הפעם\s+)?האחרונה\s+(שאדבר|שאכתוב|שאפנה)"
     r"|תודה\s+(לך\s+)?על\s+הכל"
     r"|(לא|לא\s+אהיה)\s+בסביבה\s+(הרבה\s+)?יותר\s+זמן"
     r"|(לא\s+אהיה|לא\s+אהיה\s+כאן)\s+(הרבה\s+)?יותר\s+זמן"
-    # כניעה / ייאוש עמוק
     r"|נמאס\s+לי\s+להילחם"
     r"|אין\s+לי\s+כוח\s+(להמשיך|להתמודד|ללחום|לחיות)"
     r"|לא\s+יכול\s+להמשיך\s+(ככה|כך|כבר)"
     r"|מוותר\s+(על\s+הכל|לגמרי)"
     r"|עייף\s+(כל\s+כך|מדי)\s+(מ|מ.+)(חיים|הכל|הכאב|הסבל)"
-    # שקט פתאומי / נחת לאחר תקופת סבל
     r"|סוף\s+סוף\s+(שקט|נח|שלוה|שלום)"
     r"|מרגיש\s+(שלוה|שקט|נחת)\s+(פתאום|לפתע|אחרי)"
-    # English equivalents
     r"|just\s+want\s+to\s+(disappear|not\s+exist|stop\s+existing|vanish)"
     r"|better\s+off\s+without\s+me"
     r"|no\s+one\s+(would|will)\s+(miss|notice|care)"
@@ -444,9 +504,11 @@ _PASSIVE_IDEATION_RE = re.compile(
 )
 
 def is_passive_ideation(text):
-    """v62: זיהוי ביטויים עקיפים של מחשבות אובדניות שלא נכללים ב-_CRISIS_WORDS."""
     return bool(_PASSIVE_IDEATION_RE.search(_normalize_text(text)))
 
+# ─────────────────────────────────────────────
+# שכבה ג' — אותות עצב (סופרים, אחרי 3 → MSG_CRISIS)
+# ─────────────────────────────────────────────
 _SAD_WORDS_RE = re.compile(
     r"עצוב|עצובה|כואב|כואבת|לא יכול|לא יכולה|קשה לי|בוכה|מפחד|מפחדת|"
     r"לבד|לבדי|אין לי|אף אחד|דיכאון|חרדה|פחד|בהלה|פאניקה|"
@@ -461,7 +523,7 @@ def has_sad_signal(text):
     return bool(_SAD_WORDS_RE.search(text))
 
 # ─────────────────────────────────────────────
-# Guardian injection — ללא שינוי
+# Guardian — חסימת prompt injection
 # ─────────────────────────────────────────────
 _INJECTION_PATTERNS = [
     r"ignore\s+(previous|all|above|prior|earlier)\s*(instructions?|prompt|rules?|context)?",
@@ -505,7 +567,7 @@ def guardian_check_input(text):
     return bool(_injection_re.search(_normalize_text(text)))
 
 # ─────────────────────────────────────────────
-# Whitelist הודעות יוצאות
+# Whitelist להודעות יוצאות
 # ─────────────────────────────────────────────
 _ALLOWED_OUTGOING = set()
 
@@ -514,12 +576,10 @@ def _build_allowed_outgoing():
                 MSG_CRISIS, MSG_SOFT_CHECK, MSG_OFF_TOPIC, MSG_BREATHING_STOP, MSG_RESET,
                 BREATHING_START, GROUNDING_NUDGE_1, GROUNDING_NUDGE_2,
                 MSG_BREATHING_WAIT_CONFIRM, MSG_GROUNDING_POSITIVE,
-                # v61: הודעות retry קרקוע
                 "בסדר גמור, בוא נמשיך הלאה בעדינות \U0001f499"]:
         _ALLOWED_OUTGOING.add(msg.strip())
     for msg in BREATHING_PARTS:
         _ALLOWED_OUTGOING.add(msg.strip())
-    # v61: GROUNDING_STEPS הם tuples — נוסיף רק את הטקסט (אינדקס 0)
     for step_text, _btn in GROUNDING_STEPS:
         _ALLOWED_OUTGOING.add(step_text.strip())
     for hint in GROUNDING_HINTS:
@@ -531,7 +591,7 @@ def is_allowed_outgoing(text):
     return text.strip() in _ALLOWED_OUTGOING
 
 # ─────────────────────────────────────────────
-# Rate Limiting + Blacklist
+# Rate limiting + Blacklist
 # ─────────────────────────────────────────────
 RATE_WINDOW_SEC = 60
 RATE_MAX_MSGS   = 20
@@ -574,24 +634,22 @@ def _clean_expired_blacklist():
         log.error("blacklist_clean_error", extra={"err": str(e)})
 
 # ─────────────────────────────────────────────
-# v59: cleanup תקופתי ל-Redis metrics
+# Cleanup metrics keys בלי TTL
 # ─────────────────────────────────────────────
-_LAST_METRICS_CLEANUP = 0
-_METRICS_CLEANUP_INTERVAL = 3600  # כל שעה
+_LAST_METRICS_CLEANUP     = 0
+_METRICS_CLEANUP_INTERVAL = 3600
 
 def _maybe_cleanup_metrics():
-    """v59: מנקה keys ישנים של rate limit ו-dedup מ-Redis."""
     global _LAST_METRICS_CLEANUP
     now = time.time()
     if now - _LAST_METRICS_CLEANUP < _METRICS_CLEANUP_INTERVAL:
         return
     _LAST_METRICS_CLEANUP = now
     try:
-        # ניקוי rate keys ישנים (אמור להתנקות אוטומטית ע"י TTL, זה רק safety)
         count = 0
         for key in _redis.scan_iter("sh:rate:*"):
             ttl = _redis.ttl(key)
-            if ttl < 0:  # ללא TTL
+            if ttl < 0:
                 _redis.expire(key, RATE_WINDOW_SEC)
                 count += 1
         if count:
@@ -625,6 +683,7 @@ def rate_limit_check(phone):
         _, _, count, _ = pipe.execute()
         if count > RATE_MAX_MSGS:
             add_to_blacklist(phone, reason="exceeded {} msgs/min".format(RATE_MAX_MSGS))
+            _stats_inc("rate_limited")
             return True
         return False
     except Exception as e:
@@ -662,23 +721,23 @@ def send_message(to, text):
     if not is_allowed_outgoing(text):
         log.warning("guardian_blocked_outgoing", extra={"text": text[:80]})
         return
-    _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
-                      "to": to, "type": "text", "text": {"body": text.strip()}})
+    ok = _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
+                           "to": to, "type": "text", "text": {"body": text.strip()}})
+    if ok:
+        _stats_inc("messages_out")
 
 def send_logo(to):
     _post_with_retry({"messaging_product": "whatsapp", "recipient_type": "individual",
                       "to": to, "type": "image", "image": {"link": LOGO_URL}})
 
-# v61: שליחת הודעת כפתורים אינטראקטיבית (עד 3 כפתורים)
 def send_button_message(to, text, buttons):
     if not text or not text.strip():
         return
-    # הגארדיאן — בדיקת whitelist על הטקסט
     if not is_allowed_outgoing(text):
         log.warning("guardian_blocked_outgoing_button", extra={"text": text[:80]})
         return
     btn_objs = [
-        {"type": "reply", "reply": {"id": f"btn_{i}", "title": btn[:20]}}
+        {"type": "reply", "reply": {"id": "btn_{}".format(i), "title": btn[:20]}}
         for i, btn in enumerate(buttons[:3])
     ]
     payload = {
@@ -692,14 +751,17 @@ def send_button_message(to, text, buttons):
             "action": {"buttons": btn_objs},
         },
     }
-    return _post_with_retry(payload)
+    ok = _post_with_retry(payload)
+    if ok:
+        _stats_inc("messages_out")
+    return ok
 
 # ─────────────────────────────────────────────
-# State
+# State management ב-Redis
 # ─────────────────────────────────────────────
 STATE_KEY_PREFIX = "sh:state:"
 SEEN_MSG_TTL_SEC = 120
-STATE_TTL_SEC    = 30 * 24 * 3600  # v59: 30 יום
+STATE_TTL_SEC    = 30 * 24 * 3600
 
 _STATE_DEFAULTS = {
     "tool":              "none",
@@ -708,7 +770,7 @@ _STATE_DEFAULTS = {
     "last_msg_time":     0.0,
     "wait_count":        0,
     "grounding_session": 0,
-    "grounding_retry":   0,   # v61
+    "grounding_retry":   0,
     "sad_count":         0,
     "breathing_active":  False,
 }
@@ -747,7 +809,7 @@ def _is_duplicate_msg(msg_id):
         return False
 
 # ─────────────────────────────────────────────
-# Redis reply channel
+# Breathing reply channel ב-Redis
 # ─────────────────────────────────────────────
 _BR_TTL = 120
 
@@ -783,10 +845,11 @@ def _br_wait_fast(phone, timeout=60):
     return "timeout"
 
 # ─────────────────────────────────────────────
-# run_breathing — ללא שינוי
+# תרגיל נשימה — לולאה
 # ─────────────────────────────────────────────
 def run_breathing(phone):
     log.info("breathing_start", extra={"phone": phone})
+    _stats_inc("breathing_started")
     while True:
         s = get_state(phone)
         if s.get("tool") != "breathing":
@@ -815,7 +878,7 @@ def run_breathing(phone):
         return
 
 # ─────────────────────────────────────────────
-# קרקוע — nudges — ללא שינוי
+# קרקוע — nudges
 # ─────────────────────────────────────────────
 def nudge_if_silent_grounding(phone, my_step, my_session):
     time.sleep(60)
@@ -836,7 +899,7 @@ def nudge_after_welcome(phone, welcomed_time):
         send_message(phone, MSG_WELCOME_NUDGE)
 
 # ─────────────────────────────────────────────
-# נעילת phone
+# נעילה לפי phone (הודעות לאותו משתמש לא יתקעו אחת בשנייה)
 # ─────────────────────────────────────────────
 _phone_locks      = {}
 _phone_locks_lock = threading.Lock()
@@ -861,39 +924,60 @@ def _send_logo_and_welcome(phone, now):
     _enqueue(nudge_after_welcome, phone, now)
 
 # ─────────────────────────────────────────────
-# לוגיקה מרכזית — ללא שינוי בתרגילים
+# טיפול chat-mode בקרקוע
+# ─────────────────────────────────────────────
+_GROUNDING_CHAT_PHRASES = [
+    "מה זה", "למה אתה", "מה אתה", "מה את",
+    "לא רוצה", "אני רוצה לדבר",
+    "תגיד לי", "הסבר לי",
+    "i don't want to", "tell me about",
+]
+_grounding_chat_re = re.compile(
+    "|".join(re.escape(p) for p in _GROUNDING_CHAT_PHRASES), re.IGNORECASE
+)
+
+def is_grounding_chat(text):
+    return bool(_grounding_chat_re.search(text.lower()))
+
+# ─────────────────────────────────────────────
+# הלוגיקה המרכזית
 # ─────────────────────────────────────────────
 def handle_message(phone, text, msg_type="text"):
     with _get_phone_lock(phone):
         _handle_message_inner(phone, text, msg_type)
 
 def _handle_message_inner(phone, text, msg_type="text"):
-    _maybe_cleanup_metrics()  # v59: cleanup תקופתי
+    _maybe_cleanup_metrics()
     text = _clean_text(text)
     t    = text.lower()
 
-    # 1. שכבה א' — משבר מפורש (מיידי → MSG_CRISIS)
+    _stats_inc("messages_in")
+    _stats_track_user(phone)
+
+    # שכבה א' — משבר מפורש (מיידי)
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
+        _stats_inc("crisis_detected")
         set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
         _br_clear(phone)
         send_message(phone, MSG_CRISIS)
         return
 
-    # 2. rate limit
+    # rate limit
     if rate_limit_check(phone):
         return
 
     s   = get_state(phone)
     now = time.time()
 
-    # 3. debounce
+    # debounce
     if now - s["last_msg_time"] < DEBOUNCE_SEC:
         return
 
-    # 4. injection
+    # injection
     if guardian_check_input(text):
         log.warning("injection_attempt", extra={"phone": phone, "text": text[:80]})
+        _stats_inc("injection_blocked")
         set_state(phone, tool="none", step=0, breathing_active=False)
         _br_clear(phone)
         send_message(phone, MSG_OFF_TOPIC)
@@ -908,20 +992,22 @@ def _handle_message_inner(phone, text, msg_type="text"):
     tool = s["tool"]
     step = s["step"]
 
-    # 5. שכבה ב' — אידאציה פסיבית (v62: בירור עדין → MSG_SOFT_CHECK)
+    # שכבה ב' — אידאציה פסיבית (בירור עדין)
     if is_passive_ideation(text):
         log.info("passive_ideation_detected", extra={"phone": phone})
+        _stats_inc("passive_ideation")
         set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
         _br_clear(phone)
         send_message(phone, MSG_SOFT_CHECK)
         return
 
-    # 6. שכבה ג' — אותות עצב (ספירה → MSG_CRISIS לאחר 3)
+    # שכבה ג' — אותות עצב (3 בצמידות → MSG_CRISIS)
     if has_sad_signal(text):
         new_sad = s.get("sad_count", 0) + 1
         set_state(phone, sad_count=new_sad)
         if new_sad >= 3:
             log.info("escalation_crisis", extra={"phone": phone, "sad_count": new_sad})
+            _stats_inc("crisis_detected")
             set_state(phone, tool="none", step=0, sad_count=0, breathing_active=False)
             _br_clear(phone)
             send_message(phone, MSG_CRISIS)
@@ -930,13 +1016,13 @@ def _handle_message_inner(phone, text, msg_type="text"):
         if s.get("sad_count", 0) > 0:
             set_state(phone, sad_count=0)
 
-    # 6. משתמש חדש
+    # משתמש חדש
     if not s["welcomed"]:
         set_state(phone, welcomed=True)
         _enqueue(_send_logo_and_welcome, phone, now)
         return
 
-    # ── 7. נשימה פעילה ──
+    # נשימה פעילה
     if tool == "breathing":
         if t in BREATHING_STOP_WORDS:
             set_state(phone, tool="none", step=0, breathing_active=False)
@@ -952,19 +1038,17 @@ def _handle_message_inner(phone, text, msg_type="text"):
                 return
         return
 
-    # ── 8. קרקוע פעיל ──
+    # קרקוע פעיל
     if tool == "grounding":
         gs = s["grounding_session"]
-        is_button_click = (msg_type == "interactive")  # v61
+        is_button_click = (msg_type == "interactive")
 
-        # עצירה
         if t in GROUNDING_RESET_WORDS:
             set_state(phone, tool="none", step=0, wait_count=0,
                       grounding_session=gs + 1, grounding_retry=0)
             send_message(phone, MSG_GROUNDING_POSITIVE if step > 0 else MSG_RESET)
             return
 
-        # chat
         if is_grounding_chat(text):
             send_message(phone, GROUNDING_CHAT_REPLY.format(
                 hint=GROUNDING_HINTS[min(step, len(GROUNDING_HINTS)-1)]))
@@ -983,8 +1067,7 @@ def _handle_message_inner(phone, text, msg_type="text"):
                 send_message(phone, MSG_RETURNING)
             return
 
-        # v61: ולידציה — האם המשתמש אכן ביצע את השלב?
-        # לחיצת כפתור = אישור מיידי; "קצת קשה" = דילוג; טקסט מספיק ארוך = תשובה תקינה
+        # ולידציה — לחיצת כפתור / "קצת קשה" / טקסט כלשהו
         answered = is_button_click or "קצת קשה" in t or len(text.split()) >= 1
 
         if answered:
@@ -994,15 +1077,13 @@ def _handle_message_inner(phone, text, msg_type="text"):
                       grounding_session=new_gs, grounding_retry=0)
             step_text, btn_label = GROUNDING_STEPS[next_step]
             if btn_label:
-                # v61: כפתור התקדמות + אפשרות "קצת קשה לי"
                 send_button_message(phone, step_text, [btn_label, "קצת קשה לי"])
             else:
                 send_message(phone, step_text)
             _enqueue(nudge_if_silent_grounding, phone, next_step, new_gs)
             return
 
-        # v61: retry — לא אמור להגיע לכאן עם הלוגיקה הנוכחית (answered=True תמיד)
-        # שמור כ-safety net
+        # safety net (כמעט בלתי אפשרי להגיע לכאן)
         retry_count = s.get("grounding_retry", 0) + 1
         if retry_count >= GROUNDING_MAX_RETRIES:
             next_step = step + 1
@@ -1021,17 +1102,18 @@ def _handle_message_inner(phone, text, msg_type="text"):
             send_message(phone, GROUNDING_NUDGE_1)
         return
 
-    # ── 9. בחירת נשימה ──
+    # בחירת נשימה
     if text == "א" or t == "a":
         set_state(phone, tool="breathing", step=0, breathing_active=False)
         _enqueue(run_breathing, phone)
         return
 
-    # ── 10. בחירת קרקוע ──
+    # בחירת קרקוע
     if text == "ב" or t == "b":
         new_gs = s["grounding_session"] + 1
         set_state(phone, tool="grounding", step=0, wait_count=0,
                   grounding_session=new_gs, grounding_retry=0)
+        _stats_inc("grounding_started")
         step_text, btn_label = GROUNDING_STEPS[0]
         if btn_label:
             send_button_message(phone, step_text, [btn_label, "קצת קשה לי"])
@@ -1040,35 +1122,209 @@ def _handle_message_inner(phone, text, msg_type="text"):
         _enqueue(nudge_if_silent_grounding, phone, 0, new_gs)
         return
 
-    # 11. ברכה
+    # ברכה
     if t in GREET_WORDS:
         send_message(phone, MSG_RETURNING)
         return
 
-    # 12. off-topic
+    # off-topic
     send_message(phone, MSG_OFF_TOPIC)
 
-_GROUNDING_CHAT_PHRASES = [
-    "מה זה", "למה אתה", "מה אתה", "מה את",
-    "לא רוצה", "אני רוצה לדבר",
-    "תגיד לי", "הסבר לי",
-    "i don't want to", "tell me about",
-]
-_grounding_chat_re = re.compile(
-    "|".join(re.escape(p) for p in _GROUNDING_CHAT_PHRASES), re.IGNORECASE
-)
+# ─────────────────────────────────────────────
+# Stats login + dashboard
+# ─────────────────────────────────────────────
+STATS_SESSION_KEY = "sh:stats_session:"
+STATS_SESSION_TTL = 8 * 3600  # 8 שעות
 
-def is_grounding_chat(text):
-    return bool(_grounding_chat_re.search(text.lower()))
+def _create_stats_session():
+    token = secrets.token_urlsafe(32)
+    try:
+        _redis.set(STATS_SESSION_KEY + token, "1", ex=STATS_SESSION_TTL)
+    except Exception as e:
+        log.error("stats_session_create_error", extra={"err": str(e)})
+    return token
+
+def _check_stats_session(token):
+    if not token:
+        return False
+    try:
+        return _redis.exists(STATS_SESSION_KEY + token) > 0
+    except Exception:
+        return False
+
+@app.route("/stats/login", methods=["GET", "POST"])
+def stats_login():
+    if not STATS_PASSWORD:
+        return "Stats page disabled. Set STATS_PASSWORD env var.", 503
+
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        ip       = request.remote_addr or "unknown"
+        if hmac.compare_digest(password, STATS_PASSWORD):
+            token = _create_stats_session()
+            log.info("stats_login_success", extra={"ip": ip})
+            resp  = make_response(redirect("/stats"))
+            resp.set_cookie("sh_stats", token, max_age=STATS_SESSION_TTL,
+                          httponly=True, samesite="Strict")
+            return resp
+        else:
+            log.warning("stats_login_failed", extra={"ip": ip})
+            return _render_stats_login(error="סיסמה שגויה"), 401
+
+    return _render_stats_login()
+
+def _render_stats_login(error=None):
+    err_html = ('<div style="color:#dc2626;background:#fee2e2;padding:10px;'
+                'border-radius:8px;margin-bottom:14px;font-size:14px">{}</div>'
+                .format(error)) if error else ""
+    return (
+        '<!doctype html><html lang="he" dir="rtl"><head>'
+        '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>SafeHarbor Stats — כניסה</title>'
+        '<style>'
+        '*{box-sizing:border-box}'
+        'body{font-family:system-ui,sans-serif;background:#f1f5f9;'
+        'display:flex;align-items:center;justify-content:center;height:100vh;margin:0}'
+        '.card{background:#fff;padding:36px 28px;border-radius:16px;'
+        'box-shadow:0 4px 24px #0001;width:340px;max-width:90vw}'
+        'h1{margin:0 0 22px;font-size:20px;color:#0f172a;text-align:center}'
+        'input[type=password]{width:100%;padding:12px 14px;border:1px solid #cbd5e1;'
+        'border-radius:10px;font-size:15px;margin-bottom:14px;outline:none}'
+        'input[type=password]:focus{border-color:#3b82f6}'
+        'button{width:100%;padding:12px;background:#0ea5e9;color:#fff;border:none;'
+        'border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}'
+        'button:hover{background:#0284c7}'
+        '</style></head><body>'
+        '<div class="card"><h1>\u2693 SafeHarbor Stats</h1>'
+        + err_html +
+        '<form method="POST">'
+        '<input type="password" name="password" placeholder="סיסמה" required autofocus>'
+        '<button type="submit">כניסה</button>'
+        '</form></div></body></html>'
+    )
+
+@app.route("/stats/logout", methods=["GET"])
+def stats_logout():
+    token = request.cookies.get("sh_stats")
+    if token:
+        try:
+            _redis.delete(STATS_SESSION_KEY + token)
+        except Exception:
+            pass
+    resp = make_response(redirect("/stats/login"))
+    resp.set_cookie("sh_stats", "", expires=0)
+    return resp
+
+@app.route("/stats", methods=["GET"])
+def stats_dashboard():
+    if not STATS_PASSWORD:
+        return "Stats page disabled. Set STATS_PASSWORD env var.", 503
+
+    token = request.cookies.get("sh_stats")
+    if not _check_stats_session(token):
+        return redirect("/stats/login")
+
+    s_24h = _stats_collect(1)
+    s_7d  = _stats_collect(7)
+    s_30d = _stats_collect(30)
+    s_all = _stats_collect_all()
+
+    def fmt_card(title, data, color):
+        return (
+            '<div class="card" style="border-top:4px solid {color}">'
+            '<h2>{title}</h2>'
+            '<div class="grid">'
+            '<div class="metric"><span class="num">{users}</span><span class="lbl">משתמשים ייחודיים</span></div>'
+            '<div class="metric"><span class="num">{msg_in}</span><span class="lbl">הודעות נכנסות</span></div>'
+            '<div class="metric"><span class="num">{msg_out}</span><span class="lbl">הודעות יוצאות</span></div>'
+            '<div class="metric"><span class="num">{br}</span><span class="lbl">תרגילי נשימה</span></div>'
+            '<div class="metric"><span class="num">{gr}</span><span class="lbl">תרגילי קרקוע</span></div>'
+            '<div class="metric crisis"><span class="num">{cr}</span><span class="lbl">זיהויי משבר</span></div>'
+            '<div class="metric warn"><span class="num">{pi}</span><span class="lbl">אידאציה פסיבית</span></div>'
+            '<div class="metric"><span class="num">{inj}</span><span class="lbl">ניסיונות injection</span></div>'
+            '<div class="metric"><span class="num">{rl}</span><span class="lbl">חסימות rate-limit</span></div>'
+            '</div></div>'
+        ).format(
+            title=title, color=color,
+            users=data["unique_users"],
+            msg_in=data["messages_in"],
+            msg_out=data["messages_out"],
+            br=data["breathing_started"],
+            gr=data["grounding_started"],
+            cr=data["crisis_detected"],
+            pi=data["passive_ideation"],
+            inj=data["injection_blocked"],
+            rl=data["rate_limited"],
+        )
+
+    redis_ok = False
+    try:
+        _redis.ping()
+        redis_ok = True
+    except Exception:
+        pass
+
+    uptime_sec = int(time.time() - _START_TIME)
+    uptime_str = "{}d {}h {}m".format(
+        uptime_sec // 86400,
+        (uptime_sec % 86400) // 3600,
+        (uptime_sec % 3600) // 60,
+    )
+
+    return (
+        '<!doctype html><html lang="he" dir="rtl"><head>'
+        '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>SafeHarbor Stats</title>'
+        '<style>'
+        '*{box-sizing:border-box;margin:0;padding:0}'
+        'body{font-family:system-ui,sans-serif;background:#f1f5f9;color:#0f172a;padding:20px;min-height:100vh}'
+        '.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px}'
+        '.header h1{font-size:22px;color:#0f172a}'
+        '.header .info{font-size:13px;color:#64748b}'
+        '.logout{background:#e2e8f0;color:#475569;padding:8px 16px;border-radius:8px;'
+        'text-decoration:none;font-size:13px}'
+        '.logout:hover{background:#cbd5e1}'
+        '.card{background:#fff;padding:20px;border-radius:14px;box-shadow:0 2px 8px #0001;margin-bottom:18px}'
+        '.card h2{font-size:16px;color:#475569;margin-bottom:14px;font-weight:600}'
+        '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}'
+        '.metric{background:#f8fafc;padding:14px;border-radius:10px;text-align:center}'
+        '.metric .num{display:block;font-size:24px;font-weight:700;color:#0f172a;margin-bottom:4px}'
+        '.metric .lbl{display:block;font-size:12px;color:#64748b}'
+        '.metric.crisis .num{color:#dc2626}'
+        '.metric.warn .num{color:#ea580c}'
+        '.status{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}'
+        '.status.ok{background:#dcfce7;color:#166534}'
+        '.status.err{background:#fee2e2;color:#991b1b}'
+        '@media (max-width:600px){.grid{grid-template-columns:repeat(2,1fr)}}'
+        '</style></head><body>'
+        '<div class="header">'
+        '<div>'
+        '<h1>\u2693 SafeHarbor — סטטיסטיקות</h1>'
+        '<div class="info">גרסה {ver} · uptime {up} · Redis '
+        '<span class="status {rc}">{rs}</span></div>'
+        '</div>'
+        '<a href="/stats/logout" class="logout">יציאה</a>'
+        '</div>'
+        + fmt_card("\U0001f550 24 שעות אחרונות", s_24h, "#0ea5e9")
+        + fmt_card("\U0001f4c5 7 ימים אחרונים", s_7d, "#8b5cf6")
+        + fmt_card("\U0001f4ca 30 ימים אחרונים", s_30d, "#ec4899")
+        + fmt_card("\U0001f30d מאז התקנה", s_all, "#10b981")
+        + '</body></html>'
+    ).format(
+        ver=VERSION,
+        up=uptime_str,
+        rc="ok" if redis_ok else "err",
+        rs="OK" if redis_ok else "ERROR",
+    )
 
 # ─────────────────────────────────────────────
-# Admin Dashboard — v59: הסרת AK מ-JS, הוספת audit
+# Admin dashboard (blacklist)
 # ─────────────────────────────────────────────
 @app.route("/admin", methods=["GET"])
 def admin_dashboard():
     ip = request.remote_addr or "unknown"
     if not _admin_rate_ok(ip):
-        log.warning("admin_rate_limited", extra={"ip": ip})  # v59
+        log.warning("admin_rate_limited", extra={"ip": ip})
         return jsonify({"error": "too many requests"}), 429
     if not _check_admin_key(request):
         return (
@@ -1083,7 +1339,7 @@ def admin_dashboard():
             '</div></body></html>'
         ), 401
 
-    _admin_audit("dashboard_view", ip)  # v59
+    _admin_audit("dashboard_view", ip)
     _clean_expired_blacklist()
     try:
         raw     = _redis.hgetall(BLACKLIST_KEY)
@@ -1104,7 +1360,6 @@ def admin_dashboard():
     if not rows:
         rows = '<tr><td colspan="4" style="text-align:center;color:#888;padding:24px">אין מספרים חסומים</td></tr>'
 
-    # v59: הוסרה חשיפת AK מ-JavaScript — הדפדפן שולח את ה-header ישירות
     html = (
         '<html><head><title>SafeHarbor Admin</title>'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1128,7 +1383,6 @@ def admin_dashboard():
         '<input id="new-phone" type="text" placeholder="972501234567" dir="ltr">'
         '<input id="ak-input" type="password" placeholder="Admin Key" dir="ltr" style="max-width:160px">'
         '<button onclick="addPhone()">חסום</button></div></div>'
-        # v59: AK נלקח מ-input בדף, לא מ-cookie — לא נשמר ב-JS
         '<script>'
         'function getH(){return{"X-Admin-Key":document.getElementById("ak-input").value,"Content-Type":"application/json"};}'
         'function showMsg(t,ok){const e=document.getElementById("msg");e.textContent=t;e.style.display="block";'
@@ -1153,7 +1407,7 @@ def admin_list_blacklist():
     ip = request.remote_addr or "unknown"
     if not _check_admin_key(request):
         return jsonify({"error": "unauthorized"}), 401
-    _admin_audit("blacklist_list", ip)  # v59
+    _admin_audit("blacklist_list", ip)
     try:
         raw = _redis.hgetall(BLACKLIST_KEY)
         bl  = {k: json.loads(v) for k, v in raw.items()}
@@ -1167,7 +1421,7 @@ def admin_remove_blacklist(phone):
     if not _check_admin_key(request):
         return jsonify({"error": "unauthorized"}), 401
     result = remove_from_blacklist(phone)
-    _admin_audit("blacklist_remove", ip, phone=phone, extra={"result": result})  # v59
+    _admin_audit("blacklist_remove", ip, phone=phone, extra={"result": result})
     return jsonify({"status": "removed" if result else "not_found", "phone": phone}), 200
 
 @app.route("/admin/blacklist/<phone>", methods=["POST"])
@@ -1177,11 +1431,11 @@ def admin_add_blacklist(phone):
         return jsonify({"error": "unauthorized"}), 401
     reason = request.json.get("reason", "manual") if request.json else "manual"
     add_to_blacklist(phone, reason=reason)
-    _admin_audit("blacklist_add", ip, phone=phone, extra={"reason": reason})  # v59
+    _admin_audit("blacklist_add", ip, phone=phone, extra={"reason": reason})
     return jsonify({"status": "blacklisted", "phone": phone}), 200
 
 # ─────────────────────────────────────────────
-# Webhook — v59: signature verification
+# Webhook (WhatsApp)
 # ─────────────────────────────────────────────
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -1194,7 +1448,6 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def receive_message():
-    # v59: אימות חתימת Meta
     if not _verify_meta_signature(request):
         log.warning("webhook_signature_rejected", extra={"ip": request.remote_addr})
         return jsonify({"error": "invalid signature"}), 403
@@ -1208,16 +1461,14 @@ def receive_message():
                     msg_type = msg.get("type", "text")
                     msg_id   = msg.get("id", "")
 
-                    # v61: חילוץ טקסט לפי סוג ההודעה
                     if msg_type == "text":
                         text = msg["text"]["body"]
                     elif msg_type == "interactive":
-                        # כפתור reply — הטקסט הוא title של הכפתור
                         text = (msg.get("interactive", {})
                                    .get("button_reply", {})
                                    .get("title", ""))
                     else:
-                        continue  # סוגים אחרים (תמונה וכו') — מתעלמים
+                        continue
 
                     if not text:
                         continue
@@ -1245,15 +1496,19 @@ def health():
     status = 200 if redis_ok else 503
     return jsonify({
         "status":  "ok" if redis_ok else "degraded",
-        "version": "v62",
+        "version": VERSION,
         "uptime":  int(time.time() - _START_TIME),
         "redis":   "ok" if redis_ok else "error",
         "queue":   "rq" if _USE_RQ else "threadpool",
     }), status
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return health()
+
 @app.route("/", methods=["GET"])
 def root():
-    return "SafeHarbor Bot is running v62", 200
+    return "SafeHarbor Bot is running {}".format(VERSION), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
