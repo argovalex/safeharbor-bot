@@ -1,9 +1,10 @@
-# SafeHarbor Bot v63
+# SafeHarbor Bot v64
 # בוט תמיכה רגשית בעברית בוואטסאפ
 # - תרגילי נשימה (5-5-5-5, 3 סבבים)
 # - תרגילי קרקוע (5-4-3-2-1)
 # - זיהוי משבר 3 שכבות: CRISIS / PASSIVE / SAD
 # - דף /stats מוגן בסיסמה עם סטטיסטיקות שימוש
+# - מנוי: 30 יום ניסיון לכל מספר, הארכה ידנית (חודש/שנה/VIP) דרך /stats
 
 import os, time, json, logging, threading, hmac, hashlib, secrets
 import requests as http_requests
@@ -42,7 +43,7 @@ if _SENTRY_DSN:
 # ─────────────────────────────────────────────
 app         = Flask(__name__)
 _START_TIME = time.time()
-VERSION     = "v63"
+VERSION     = "v64"
 
 WHATSAPP_TOKEN      = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID   = os.environ.get("WHATSAPP_PHONE_ID", "")
@@ -136,7 +137,7 @@ def _stats_collect(days):
     """אוסף סטטיסטיקות לטווח של N ימים אחורה (כולל היום)."""
     metrics = ["messages_in", "messages_out", "breathing_started",
                "grounding_started", "crisis_detected", "passive_ideation",
-               "injection_blocked", "rate_limited"]
+               "injection_blocked", "rate_limited", "trial_expired"]
     result = {m: 0 for m in metrics}
     unique_users = set()
 
@@ -163,7 +164,7 @@ def _stats_collect_all():
     """אוסף את כל הסטטיסטיקות מאז התקנה (סורק SCAN)."""
     metrics = ["messages_in", "messages_out", "breathing_started",
                "grounding_started", "crisis_detected", "passive_ideation",
-               "injection_blocked", "rate_limited"]
+               "injection_blocked", "rate_limited", "trial_expired"]
     result = {m: 0 for m in metrics}
     unique_users = set()
 
@@ -183,8 +184,183 @@ def _stats_collect_all():
     return result
 
 # ─────────────────────────────────────────────
-# אימות חתימת Meta
+# מנויים (Subscriptions) — תקופת ניסיון 30 יום + הארכה ידנית
+# מבנה Redis:
+#   sh:sub:{phone} → JSON {first_seen, expires_at, plan, vip}
+#     - first_seen: epoch של פנייה ראשונה (לחישוב אוטומטי של ניסיון)
+#     - expires_at: epoch של פקיעה (None ל-VIP)
+#     - plan: "trial" / "monthly" / "yearly" / "vip"
+#     - vip: bool (פטור מתשלום, ללא הגבלת זמן)
+#   sh:sub:expired:{phone} → "1" עם TTL — סימן שכבר נשלחה הודעת פקיעה
 # ─────────────────────────────────────────────
+SUB_KEY_PREFIX     = "sh:sub:"
+SUB_EXPIRED_PREFIX = "sh:sub:expired:"
+TRIAL_DAYS         = 30
+EXPIRED_NOTICE_TTL = 7 * 24 * 3600  # ההודעה תישלח שוב אחרי 7 יום אם המשתמש ימשיך לכתוב
+
+MSG_TRIAL_EXPIRED = (
+    'תקופת הניסיון של 30 יום הסתיימה. \U0001f30a\n\n'
+    'תודה שניסית את נמל הבית \u2014 שמחתי להיות איתך.\n\n'
+    'אם תרצה להמשיך להשתמש בשירות, ניתן להירשם לתשלום באתר:\n'
+    '\U0001f517 https://alargov.com\n\n'
+    'אחרי השלמת התשלום, השירות יחזור לפעול עבורך.\n\n'
+    'זכור שתמיד יש עזרה אנושית זמינה:\n'
+    '\u260e\ufe0f ער"ן: 1201\n'
+    '\U0001f4ac https://wa.me/972528451201\n'
+    '\U0001f4ac סה"ר: https://wa.me/972543225656\n'
+    '\u260e\ufe0f נט"ל: 1-800-363-363'
+)
+
+# הערה: MSG_TRIAL_EXPIRED נשלחת ישירות ב-_post_with_retry (לא דרך send_message)
+# כי היא הודעה מערכתית; לכן לא צריך להוסיף אותה ל-_ALLOWED_OUTGOING.
+
+def _sub_get(phone):
+    """מחזיר dict של המנוי או None אם לא קיים."""
+    try:
+        raw = _redis.get(SUB_KEY_PREFIX + phone)
+        if raw:
+            return json.loads(raw)
+    except Exception as e:
+        log.error("sub_get_error", extra={"phone": phone, "err": str(e)})
+    return None
+
+def _sub_set(phone, sub):
+    """שומר מנוי ב-Redis ללא TTL (persist)."""
+    try:
+        _redis.set(SUB_KEY_PREFIX + phone, json.dumps(sub))
+    except Exception as e:
+        log.error("sub_set_error", extra={"phone": phone, "err": str(e)})
+
+def _sub_create_trial(phone):
+    """יוצר מנוי ניסיון חדש למספר טלפון."""
+    now = time.time()
+    sub = {
+        "first_seen": now,
+        "expires_at": now + TRIAL_DAYS * 86400,
+        "plan":       "trial",
+        "vip":        False,
+    }
+    _sub_set(phone, sub)
+    log.info("trial_started", extra={"phone": phone})
+    return sub
+
+def _sub_extend(phone, days):
+    """מאריך מנוי ב-N ימים. אם אין מנוי — יוצר חדש."""
+    sub = _sub_get(phone) or {
+        "first_seen": time.time(),
+        "expires_at": time.time(),
+        "plan":       "trial",
+        "vip":        False,
+    }
+    base = max(sub.get("expires_at", 0) or 0, time.time())
+    sub["expires_at"] = base + days * 86400
+    sub["vip"]        = False
+    if days >= 365:
+        sub["plan"] = "yearly"
+    elif days >= 28:
+        sub["plan"] = "monthly"
+    _sub_set(phone, sub)
+    # ניקוי דגל "כבר נשלחה הודעת פקיעה" — המשתמש פעיל שוב
+    try:
+        _redis.delete(SUB_EXPIRED_PREFIX + phone)
+    except Exception:
+        pass
+    log.info("subscription_extended", extra={"phone": phone, "days": days, "plan": sub["plan"]})
+    return sub
+
+def _sub_set_vip(phone, vip=True):
+    """מסמן/מבטל VIP — פטור מהגבלת זמן."""
+    sub = _sub_get(phone) or {
+        "first_seen": time.time(),
+        "expires_at": None,
+        "plan":       "vip" if vip else "trial",
+        "vip":        vip,
+    }
+    sub["vip"]        = vip
+    sub["plan"]       = "vip" if vip else "trial"
+    sub["expires_at"] = None if vip else (time.time() + TRIAL_DAYS * 86400)
+    _sub_set(phone, sub)
+    try:
+        _redis.delete(SUB_EXPIRED_PREFIX + phone)
+    except Exception:
+        pass
+    log.info("vip_changed", extra={"phone": phone, "vip": vip})
+    return sub
+
+def _sub_delete(phone):
+    """מחיקה מלאה (החזרת המספר למצב 'לא ידוע')."""
+    try:
+        _redis.delete(SUB_KEY_PREFIX + phone)
+        _redis.delete(SUB_EXPIRED_PREFIX + phone)
+    except Exception as e:
+        log.error("sub_delete_error", extra={"phone": phone, "err": str(e)})
+    log.info("subscription_deleted", extra={"phone": phone})
+
+def _sub_is_active(phone):
+    """
+    בודק אם מספר רשאי להשתמש בבוט.
+    יוצר מנוי ניסיון חדש אם המספר לא נראה לפני.
+    מחזיר tuple: (active: bool, sub: dict, just_expired: bool)
+    """
+    sub = _sub_get(phone)
+    if not sub:
+        sub = _sub_create_trial(phone)
+        return True, sub, False
+
+    if sub.get("vip"):
+        return True, sub, False
+
+    expires = sub.get("expires_at")
+    if expires is None:
+        return True, sub, False
+
+    if time.time() <= expires:
+        return True, sub, False
+
+    # פג תוקף — בדוק אם כבר נשלחה הודעה לאחרונה
+    try:
+        already_notified = _redis.exists(SUB_EXPIRED_PREFIX + phone) > 0
+    except Exception:
+        already_notified = False
+
+    return False, sub, not already_notified
+
+def _sub_mark_notified(phone):
+    """מסמן שנשלחה הודעת פקיעה — לא נשלח שוב כל הזמן."""
+    try:
+        _redis.set(SUB_EXPIRED_PREFIX + phone, "1", ex=EXPIRED_NOTICE_TTL)
+    except Exception as e:
+        log.error("sub_notify_mark_error", extra={"err": str(e)})
+
+def _sub_list_all():
+    """מחזיר רשימה של כל המנויים, ממוינת לפי תאריך פקיעה."""
+    result = []
+    try:
+        for key in _redis.scan_iter(SUB_KEY_PREFIX + "*"):
+            # דילוג על SUB_EXPIRED_PREFIX (מתחיל עם sh:sub:expired:)
+            if key.startswith(SUB_EXPIRED_PREFIX):
+                continue
+            phone = key[len(SUB_KEY_PREFIX):]
+            try:
+                raw = _redis.get(key)
+                if raw:
+                    sub = json.loads(raw)
+                    sub["phone"] = phone
+                    result.append(sub)
+            except Exception:
+                pass
+    except Exception as e:
+        log.error("sub_list_error", extra={"err": str(e)})
+
+    # מיון: VIP ראשון, אחר כך לפי expires_at יורד
+    def sort_key(s):
+        if s.get("vip"):
+            return (0, 0)
+        return (1, -(s.get("expires_at") or 0))
+    result.sort(key=sort_key)
+    return result
+
+
 def _verify_meta_signature(req):
     if not WHATSAPP_APP_SECRET:
         return True
@@ -954,6 +1130,25 @@ def _handle_message_inner(phone, text, msg_type="text"):
     _stats_inc("messages_in")
     _stats_track_user(phone)
 
+    # בדיקת תקופת ניסיון / מנוי (לפני הכל חוץ מ-rate limit)
+    active, sub, just_expired = _sub_is_active(phone)
+    if not active:
+        if just_expired:
+            log.info("trial_expired_notice_sent", extra={"phone": phone})
+            _stats_inc("trial_expired")
+            # שליחת הודעת פקיעה פעם אחת (לא דרך whitelist הרגיל כי זה הודעה מערכתית)
+            _post_with_retry({
+                "messaging_product": "whatsapp",
+                "recipient_type":    "individual",
+                "to":                phone,
+                "type":              "text",
+                "text":              {"body": MSG_TRIAL_EXPIRED.strip()},
+            })
+            _stats_inc("messages_out")
+            _sub_mark_notified(phone)
+        # לא ממשיכים לטפל בהודעה — המספר חסום עד שהמנוי יחודש
+        return
+
     # שכבה א' — משבר מפורש (מיידי)
     if is_crisis(text):
         log.info("crisis_detected", extra={"phone": phone})
@@ -1243,6 +1438,7 @@ def stats_dashboard():
             '<div class="metric warn"><span class="num">' + str(data["passive_ideation"]) + '</span><span class="lbl">אידאציה פסיבית</span></div>'
             '<div class="metric"><span class="num">' + str(data["injection_blocked"]) + '</span><span class="lbl">ניסיונות injection</span></div>'
             '<div class="metric"><span class="num">' + str(data["rate_limited"]) + '</span><span class="lbl">חסימות rate-limit</span></div>'
+            '<div class="metric"><span class="num">' + str(data.get("trial_expired", 0)) + '</span><span class="lbl">פקיעות ניסיון</span></div>'
             '</div></div>'
         )
 
@@ -1262,6 +1458,53 @@ def stats_dashboard():
 
     rc = "ok" if redis_ok else "err"
     rs = "OK" if redis_ok else "ERROR"
+
+    # רשימת מנויים
+    subs = _sub_list_all()
+
+    def _fmt_expires(sub):
+        if sub.get("vip"):
+            return '<span style="color:#10b981;font-weight:600">VIP \u221e</span>'
+        exp = sub.get("expires_at")
+        if not exp:
+            return '<span style="color:#64748b">\u2014</span>'
+        days_left = int((exp - time.time()) / 86400)
+        date_str = time.strftime("%Y-%m-%d", time.localtime(exp))
+        if days_left < 0:
+            return '<span style="color:#dc2626">פג ' + date_str + '</span>'
+        if days_left <= 3:
+            return '<span style="color:#ea580c">' + date_str + ' (' + str(days_left) + ' ימים)</span>'
+        return '<span style="color:#0f172a">' + date_str + ' (' + str(days_left) + ' ימים)</span>'
+
+    def _fmt_plan(sub):
+        plan = sub.get("plan", "trial")
+        if sub.get("vip"):
+            return '<span class="plan-badge vip">VIP</span>'
+        names = {"trial": "ניסיון", "monthly": "חודשי", "yearly": "שנתי"}
+        css   = {"trial": "trial",  "monthly": "monthly", "yearly": "yearly"}
+        return '<span class="plan-badge ' + css.get(plan, "trial") + '">' + names.get(plan, plan) + '</span>'
+
+    if subs:
+        sub_rows = ""
+        for sub in subs:
+            phone = sub.get("phone", "")
+            sub_rows += (
+                '<tr>'
+                '<td style="font-family:monospace;direction:ltr">' + phone + '</td>'
+                '<td>' + _fmt_plan(sub) + '</td>'
+                '<td>' + _fmt_expires(sub) + '</td>'
+                '<td class="actions">'
+                '<button onclick="extend(\'' + phone + '\',30)" class="btn-mini">+חודש</button>'
+                '<button onclick="extend(\'' + phone + '\',365)" class="btn-mini">+שנה</button>'
+                '<button onclick="toggleVip(\'' + phone + '\',' + ('false' if sub.get("vip") else 'true') + ')" class="btn-mini ' + ('btn-warn' if sub.get("vip") else 'btn-ok') + '">'
+                + ('הסר VIP' if sub.get("vip") else 'VIP') +
+                '</button>'
+                '<button onclick="removeSub(\'' + phone + '\')" class="btn-mini btn-danger">מחק</button>'
+                '</td>'
+                '</tr>'
+            )
+    else:
+        sub_rows = '<tr><td colspan="4" style="text-align:center;color:#64748b;padding:20px">אין מנויים עדיין</td></tr>'
 
     css = (
         '<style>'
@@ -1284,7 +1527,26 @@ def stats_dashboard():
         '.status{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}'
         '.status.ok{background:#dcfce7;color:#166534}'
         '.status.err{background:#fee2e2;color:#991b1b}'
-        '@media (max-width:600px){.grid{grid-template-columns:repeat(2,1fr)}}'
+        'table{width:100%;border-collapse:collapse;font-size:14px}'
+        'th{text-align:right;padding:10px 12px;background:#f8fafc;color:#64748b;font-weight:600;border-bottom:2px solid #e2e8f0;font-size:13px}'
+        'td{padding:10px 12px;border-bottom:1px solid #f1f5f9;vertical-align:middle}'
+        '.actions{display:flex;gap:6px;flex-wrap:wrap}'
+        '.btn-mini{padding:5px 10px;border:none;border-radius:6px;cursor:pointer;font-size:12px;background:#e2e8f0;color:#475569;font-family:inherit}'
+        '.btn-mini:hover{background:#cbd5e1}'
+        '.btn-mini.btn-ok{background:#10b981;color:#fff}'
+        '.btn-mini.btn-ok:hover{background:#059669}'
+        '.btn-mini.btn-warn{background:#f59e0b;color:#fff}'
+        '.btn-mini.btn-warn:hover{background:#d97706}'
+        '.btn-mini.btn-danger{background:#dc2626;color:#fff}'
+        '.btn-mini.btn-danger:hover{background:#b91c1c}'
+        '.plan-badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:600}'
+        '.plan-badge.trial{background:#fef3c7;color:#92400e}'
+        '.plan-badge.monthly{background:#dbeafe;color:#1e40af}'
+        '.plan-badge.yearly{background:#e0e7ff;color:#4338ca}'
+        '.plan-badge.vip{background:#dcfce7;color:#166534}'
+        '#msg{padding:10px 14px;border-radius:8px;margin-bottom:16px;display:none;font-size:14px;font-weight:500}'
+        '@media (max-width:600px){.grid{grid-template-columns:repeat(2,1fr)}'
+        '.actions{flex-direction:column}}'
         '</style>'
     )
 
@@ -1299,6 +1561,36 @@ def stats_dashboard():
         '</div>'
     )
 
+    subs_card = (
+        '<div class="card" style="border-top:4px solid #f59e0b">'
+        '<h2>\U0001f465 מנויים (' + str(len(subs)) + ')</h2>'
+        '<div id="msg"></div>'
+        '<table><thead>'
+        '<tr><th>טלפון</th><th>תוכנית</th><th>תוקף</th><th>פעולות</th></tr>'
+        '</thead><tbody id="subs-table">' + sub_rows + '</tbody></table>'
+        '</div>'
+    )
+
+    js = (
+        '<script>'
+        'function showMsg(t,ok){const e=document.getElementById("msg");e.textContent=t;e.style.display="block";'
+        'e.style.background=ok?"#dcfce7":"#fee2e2";e.style.color=ok?"#166534":"#dc2626";'
+        'setTimeout(()=>e.style.display="none",2500);}'
+        'function extend(p,d){fetch("/stats/api/sub/"+p+"/extend",{method:"POST",headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify({days:d})}).then(r=>r.json()).then(j=>{'
+        'if(j.ok){showMsg("הוארך ב-"+d+" ימים",true);setTimeout(()=>location.reload(),800);}'
+        'else showMsg(j.error||"שגיאה",false);});}'
+        'function toggleVip(p,v){fetch("/stats/api/sub/"+p+"/vip",{method:"POST",headers:{"Content-Type":"application/json"},'
+        'body:JSON.stringify({vip:v})}).then(r=>r.json()).then(j=>{'
+        'if(j.ok){showMsg(v?"סומן כ-VIP":"VIP הוסר",true);setTimeout(()=>location.reload(),800);}'
+        'else showMsg(j.error||"שגיאה",false);});}'
+        'function removeSub(p){if(!confirm("למחוק את "+p+"? הוא יקבל מנוי ניסיון חדש בפעם הבאה."))return;'
+        'fetch("/stats/api/sub/"+p,{method:"DELETE"}).then(r=>r.json()).then(j=>{'
+        'if(j.ok){showMsg("נמחק",true);setTimeout(()=>location.reload(),800);}'
+        'else showMsg(j.error||"שגיאה",false);});}'
+        '</script>'
+    )
+
     return (
         '<!doctype html><html lang="he" dir="rtl"><head>'
         '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1310,12 +1602,53 @@ def stats_dashboard():
         + fmt_card("\U0001f4c5 7 ימים אחרונים", s_7d, "#8b5cf6")
         + fmt_card("\U0001f4ca 30 ימים אחרונים", s_30d, "#ec4899")
         + fmt_card("\U0001f30d מאז התקנה", s_all, "#10b981")
+        + subs_card
+        + js
         + '</body></html>'
     )
 
 # ─────────────────────────────────────────────
-# Admin dashboard (blacklist)
+# API endpoints לניהול מנויים (מוגן ע"י session של /stats)
 # ─────────────────────────────────────────────
+def _check_stats_auth(req):
+    """בדיקת session מ-cookie של /stats."""
+    token = req.cookies.get("sh_stats")
+    return _check_stats_session(token)
+
+@app.route("/stats/api/sub/<phone>/extend", methods=["POST"])
+def stats_api_extend(phone):
+    if not _check_stats_auth(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        days = int((request.json or {}).get("days", 30))
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid days"}), 400
+    if days < 1 or days > 3650:
+        return jsonify({"ok": False, "error": "days out of range"}), 400
+    sub = _sub_extend(phone, days)
+    _admin_audit("sub_extend", request.remote_addr or "unknown",
+                 phone=phone, extra={"days": days, "plan": sub["plan"]})
+    return jsonify({"ok": True, "phone": phone, "expires_at": sub["expires_at"], "plan": sub["plan"]}), 200
+
+@app.route("/stats/api/sub/<phone>/vip", methods=["POST"])
+def stats_api_vip(phone):
+    if not _check_stats_auth(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    vip = bool((request.json or {}).get("vip", True))
+    sub = _sub_set_vip(phone, vip=vip)
+    _admin_audit("sub_vip_change", request.remote_addr or "unknown",
+                 phone=phone, extra={"vip": vip})
+    return jsonify({"ok": True, "phone": phone, "vip": sub["vip"]}), 200
+
+@app.route("/stats/api/sub/<phone>", methods=["DELETE"])
+def stats_api_delete(phone):
+    if not _check_stats_auth(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _sub_delete(phone)
+    _admin_audit("sub_delete", request.remote_addr or "unknown", phone=phone)
+    return jsonify({"ok": True, "phone": phone}), 200
+
+
 @app.route("/admin", methods=["GET"])
 def admin_dashboard():
     ip = request.remote_addr or "unknown"
