@@ -1231,30 +1231,19 @@ def stats_dashboard():
 
     def fmt_card(title, data, color):
         return (
-            '<div class="card" style="border-top:4px solid {color}">'
-            '<h2>{title}</h2>'
+            '<div class="card" style="border-top:4px solid ' + color + '">'
+            '<h2>' + title + '</h2>'
             '<div class="grid">'
-            '<div class="metric"><span class="num">{users}</span><span class="lbl">משתמשים ייחודיים</span></div>'
-            '<div class="metric"><span class="num">{msg_in}</span><span class="lbl">הודעות נכנסות</span></div>'
-            '<div class="metric"><span class="num">{msg_out}</span><span class="lbl">הודעות יוצאות</span></div>'
-            '<div class="metric"><span class="num">{br}</span><span class="lbl">תרגילי נשימה</span></div>'
-            '<div class="metric"><span class="num">{gr}</span><span class="lbl">תרגילי קרקוע</span></div>'
-            '<div class="metric crisis"><span class="num">{cr}</span><span class="lbl">זיהויי משבר</span></div>'
-            '<div class="metric warn"><span class="num">{pi}</span><span class="lbl">אידאציה פסיבית</span></div>'
-            '<div class="metric"><span class="num">{inj}</span><span class="lbl">ניסיונות injection</span></div>'
-            '<div class="metric"><span class="num">{rl}</span><span class="lbl">חסימות rate-limit</span></div>'
+            '<div class="metric"><span class="num">' + str(data["unique_users"]) + '</span><span class="lbl">משתמשים ייחודיים</span></div>'
+            '<div class="metric"><span class="num">' + str(data["messages_in"]) + '</span><span class="lbl">הודעות נכנסות</span></div>'
+            '<div class="metric"><span class="num">' + str(data["messages_out"]) + '</span><span class="lbl">הודעות יוצאות</span></div>'
+            '<div class="metric"><span class="num">' + str(data["breathing_started"]) + '</span><span class="lbl">תרגילי נשימה</span></div>'
+            '<div class="metric"><span class="num">' + str(data["grounding_started"]) + '</span><span class="lbl">תרגילי קרקוע</span></div>'
+            '<div class="metric crisis"><span class="num">' + str(data["crisis_detected"]) + '</span><span class="lbl">זיהויי משבר</span></div>'
+            '<div class="metric warn"><span class="num">' + str(data["passive_ideation"]) + '</span><span class="lbl">אידאציה פסיבית</span></div>'
+            '<div class="metric"><span class="num">' + str(data["injection_blocked"]) + '</span><span class="lbl">ניסיונות injection</span></div>'
+            '<div class="metric"><span class="num">' + str(data["rate_limited"]) + '</span><span class="lbl">חסימות rate-limit</span></div>'
             '</div></div>'
-        ).format(
-            title=title, color=color,
-            users=data["unique_users"],
-            msg_in=data["messages_in"],
-            msg_out=data["messages_out"],
-            br=data["breathing_started"],
-            gr=data["grounding_started"],
-            cr=data["crisis_detected"],
-            pi=data["passive_ideation"],
-            inj=data["injection_blocked"],
-            rl=data["rate_limited"],
         )
 
     redis_ok = False
@@ -1271,10 +1260,10 @@ def stats_dashboard():
         (uptime_sec % 3600) // 60,
     )
 
-    return (
-        '<!doctype html><html lang="he" dir="rtl"><head>'
-        '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<title>SafeHarbor Stats</title>'
+    rc = "ok" if redis_ok else "err"
+    rs = "OK" if redis_ok else "ERROR"
+
+    css = (
         '<style>'
         '*{box-sizing:border-box;margin:0;padding:0}'
         'body{font-family:system-ui,sans-serif;background:#f1f5f9;color:#0f172a;padding:20px;min-height:100vh}'
@@ -1296,25 +1285,32 @@ def stats_dashboard():
         '.status.ok{background:#dcfce7;color:#166534}'
         '.status.err{background:#fee2e2;color:#991b1b}'
         '@media (max-width:600px){.grid{grid-template-columns:repeat(2,1fr)}}'
-        '</style></head><body>'
+        '</style>'
+    )
+
+    header_html = (
         '<div class="header">'
         '<div>'
-        '<h1>\u2693 SafeHarbor — סטטיסטיקות</h1>'
-        '<div class="info">גרסה {ver} · uptime {up} · Redis '
-        '<span class="status {rc}">{rs}</span></div>'
+        '<h1>\u2693 SafeHarbor \u2014 סטטיסטיקות</h1>'
+        '<div class="info">גרסה ' + VERSION + ' \u00b7 uptime ' + uptime_str + ' \u00b7 Redis '
+        '<span class="status ' + rc + '">' + rs + '</span></div>'
         '</div>'
         '<a href="/stats/logout" class="logout">יציאה</a>'
         '</div>'
+    )
+
+    return (
+        '<!doctype html><html lang="he" dir="rtl"><head>'
+        '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>SafeHarbor Stats</title>'
+        + css +
+        '</head><body>'
+        + header_html
         + fmt_card("\U0001f550 24 שעות אחרונות", s_24h, "#0ea5e9")
         + fmt_card("\U0001f4c5 7 ימים אחרונים", s_7d, "#8b5cf6")
         + fmt_card("\U0001f4ca 30 ימים אחרונים", s_30d, "#ec4899")
         + fmt_card("\U0001f30d מאז התקנה", s_all, "#10b981")
         + '</body></html>'
-    ).format(
-        ver=VERSION,
-        up=uptime_str,
-        rc="ok" if redis_ok else "err",
-        rs="OK" if redis_ok else "ERROR",
     )
 
 # ─────────────────────────────────────────────
